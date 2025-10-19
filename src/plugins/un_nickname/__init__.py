@@ -188,7 +188,15 @@ async def handle_add_nickname(event: GroupMessageEvent):
     msg = event.message
     at_qq, nickname = extract_at_qq_and_nickname(msg)
 
-    if not at_qq or not nickname:
+    if not at_qq:
+        return
+
+    if not nickname:
+        existing = await fetch_user_nicknames(str(event.group_id), at_qq)
+        if existing:
+            await add_nickname_matcher.finish("该用户的昵称：" + ", ".join(existing))
+        else:
+            await add_nickname_matcher.finish("该用户没有任何昵称")
         return
 
     error_msg = validate_nickname(nickname)
