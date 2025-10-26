@@ -3,13 +3,17 @@ import re
 from datetime import datetime, timedelta
 from enum import Enum
 from functools import partial
-from typing import Literal
+from typing import Any, Literal
 
 import akshare as ak
-from nonebot import logger, on_regex
+import pandas as pd
+from nonebot import get_plugin_config, logger, on_regex
 from nonebot.adapters.onebot.v11 import Bot, Event, GroupMessageEvent, MessageEvent, MessageSegment
 from nonebot.exception import MatcherException
 from nonebot.plugin import PluginMetadata
+
+from .cache import FundDataCacheManager
+from .config import Config
 
 __plugin_meta__ = PluginMetadata(
     name="fund",
@@ -17,14 +21,48 @@ __plugin_meta__ = PluginMetadata(
     usage="发送代码查询信息:\n- 场外基金: 018957、002170\n- 场内ETF: 510300、159915\n- 场内LOF: 163406、501018\n- 个股(需带交易所): 000001.SZ、600000.SH",
 )
 
-# 配置常量
-HISTORY_DAYS = 30  # 获取历史数据天数
-DISPLAY_RECENT_DAYS = 7  # 显示最近天数
-CACHE_TTL_MINUTES = 5  # 缓存时间（分钟）
 
-# 全局缓存
-_etf_cache = {"data": None, "timestamp": None}
-_lof_cache = {"data": None, "timestamp": None}
+# 延迟加载插件配置（避免在模块导入时初始化）
+def _get_plugin_config() -> Config:
+    """获取插件配置，使用缓存避免重复获取"""
+    if not hasattr(_get_plugin_config, "_cached_config"):
+        _get_plugin_config._cached_config = get_plugin_config(Config)
+    return _get_plugin_config._cached_config
+
+
+# 默认配置常量（当 NoneBot 未初始化时使用）
+DEFAULT_HISTORY_DAYS = 30
+DEFAULT_DISPLAY_RECENT_DAYS = 7
+DEFAULT_CACHE_TTL_MINUTES = 5
+
+
+# 获取配置值的辅助函数
+def _get_config_value(attr_name: str, default_value: Any) -> Any:
+    """安全地获取配置值，如果 NoneBot 未初始化则使用默认值"""
+    try:
+        config = _get_plugin_config()
+        return getattr(config, attr_name, default_value)
+    except ValueError:
+        # NoneBot has not been initialized
+        return default_value
+
+
+# 延迟初始化缓存管理器
+_cache_manager = None
+
+
+def _get_cache_manager() -> FundDataCacheManager:
+    """获取缓存管理器实例"""
+    global _cache_manager
+    if _cache_manager is None:
+        max_size = _get_config_value("fund_max_cache_size", 100)
+        _cache_manager = FundDataCacheManager(max_size=max_size)
+    return _cache_manager
+
+
+# 旧的全局缓存变量已被线程安全的缓存管理器替代
+# _etf_cache = {"data": None, "timestamp": None}  # 已废弃
+# _lof_cache = {"data": None, "timestamp": None}  # 已废弃
 
 
 class CodeType(Enum):
@@ -70,7 +108,7 @@ def identify_code_type(code: str) -> CodeType:
 
     # ETF前缀定义 (基于中国证券市场实际编码规则)
     etf_prefixes_sh = {"51", "58", "56", "55"}  # 上交所ETF前缀
-    etf_prefixes_sz = {"15"}                    # 深交所ETF前缀
+    etf_prefixes_sz = {"15"}  # 深交所ETF前缀
 
     # LOF前缀定义
     lof_prefixes = {"16", "50"}  # LOF基金前缀
@@ -98,42 +136,133 @@ def identify_code_type(code: str) -> CodeType:
 fund_query = on_regex(r"^(\d{6}|\d{6}\.(SZ|SH|BJ))$", re.IGNORECASE)
 
 
-async def get_etf_spot_data_cached():
-    """获取ETF实时数据（带缓存）"""
-    now = datetime.now()
-    cache_expired = (
-        _etf_cache["data"] is None
-        or _etf_cache["timestamp"] is None
-        or now - _etf_cache["timestamp"] > timedelta(minutes=CACHE_TTL_MINUTES)
-    )
+def _normalize_etf_data_from_ths(df: pd.DataFrame) -> pd.DataFrame:
+    """将同花顺 ETF 数据格式转换为东方财富格式
 
-    if cache_expired:
-        logger.info("ETF缓存过期，重新获取数据")
+    Args:
+        df: 同花顺 ETF 数据 DataFrame
+
+    Returns:
+        转换后的 DataFrame（兼容东方财富格式）
+    """
+    # 创建列名映射
+    column_mapping = {
+        "基金代码": "代码",
+        "基金名称": "名称",
+        "当前-单位净值": "最新价",
+        "增长率": "涨跌幅",
+        "增长值": "涨跌额",
+    }
+
+    # 只保留和重命名需要的列
+    new_df = df.copy()
+
+    # 重命名列
+    for old_col, new_col in column_mapping.items():
+        if old_col in new_df.columns:
+            new_df = new_df.rename(columns={old_col: new_col})
+
+    # 添加缺失的列（同花顺没有成交量和成交额）
+    if "成交量" not in new_df.columns:
+        new_df["成交量"] = "N/A"
+    if "成交额" not in new_df.columns:
+        new_df["成交额"] = "N/A"
+
+    # 确保必需的列存在
+    required_columns = ["代码", "名称", "最新价", "涨跌幅", "涨跌额"]
+    for col in required_columns:
+        if col not in new_df.columns:
+            logger.warning(f"同花顺数据缺少列: {col}")
+            new_df[col] = "N/A"
+
+    return new_df
+
+
+async def get_etf_spot_data_cached() -> pd.DataFrame:
+    """获取ETF实时数据（带线程安全缓存）
+
+    实现了智能缓存和多数据源切换策略：
+    - 使用线程安全的异步缓存防止竞态条件
+    - 缓存未过期时直接返回缓存数据
+    - 缓存过期时尝试获取新数据
+    - 优先使用东方财富接口，失败后自动切换到同花顺接口
+    - 新数据获取失败但有旧缓存时，使用旧缓存并警告
+
+    Returns:
+        ETF 实时数据 DataFrame
+
+    Raises:
+        Exception: 所有数据源都失败且无缓存时抛出异常
+    """
+
+    async def fetch_etf_data_em() -> pd.DataFrame:
+        """获取东方财富ETF数据"""
         loop = asyncio.get_event_loop()
-        _etf_cache["data"] = await loop.run_in_executor(None, ak.fund_etf_spot_em)
-        _etf_cache["timestamp"] = now
-        logger.info(f"ETF数据已缓存，共{len(_etf_cache['data'])}条记录")
+        return await loop.run_in_executor(None, ak.fund_etf_spot_em)
 
-    return _etf_cache["data"]
-
-
-async def get_lof_spot_data_cached():
-    """获取LOF实时数据（带缓存）"""
-    now = datetime.now()
-    cache_expired = (
-        _lof_cache["data"] is None
-        or _lof_cache["timestamp"] is None
-        or now - _lof_cache["timestamp"] > timedelta(minutes=CACHE_TTL_MINUTES)
-    )
-
-    if cache_expired:
-        logger.info("LOF缓存过期，重新获取数据")
+    async def fetch_etf_data_ths() -> pd.DataFrame:
+        """获取同花顺ETF数据并规范化格式"""
         loop = asyncio.get_event_loop()
-        _lof_cache["data"] = await loop.run_in_executor(None, ak.fund_lof_spot_em)
-        _lof_cache["timestamp"] = now
-        logger.info(f"LOF数据已缓存，共{len(_lof_cache['data'])}条记录")
+        data = await loop.run_in_executor(None, ak.fund_etf_spot_ths)
+        return _normalize_etf_data_from_ths(data)
 
-    return _lof_cache["data"]
+    async def primary_fetch() -> pd.DataFrame:
+        """主数据源获取函数"""
+        return await fetch_etf_data_em()
+
+    async def fallback_fetch() -> pd.DataFrame:
+        """备用数据源获取函数"""
+        return await fetch_etf_data_ths()
+
+    # 使用新的线程安全缓存，支持主备数据源切换
+    cache_manager = _get_cache_manager()
+    ttl_minutes = _get_config_value("fund_cache_ttl_minutes", DEFAULT_CACHE_TTL_MINUTES)
+
+    try:
+        return await cache_manager.etf_cache.get_or_update(
+            key="etf_spot_data",
+            fetch_func=primary_fetch,
+            ttl_minutes=ttl_minutes,
+            data_type="ETF(东方财富)",
+        )
+    except Exception:
+        # 主数据源失败，尝试备用数据源
+        logger.warning("东方财富 ETF 接口失败，尝试备用数据源")
+        return await cache_manager.etf_cache.get_or_update(
+            key="etf_spot_data_ths",
+            fetch_func=fallback_fetch,
+            ttl_minutes=ttl_minutes,
+            data_type="ETF(同花顺备用)",
+        )
+
+
+async def get_lof_spot_data_cached() -> pd.DataFrame:
+    """获取LOF实时数据（带线程安全缓存）
+
+    实现了智能缓存策略：
+    - 使用线程安全的异步缓存防止竞态条件
+    - 缓存未过期时直接返回缓存数据
+    - 缓存过期时尝试获取新数据
+    - 新数据获取失败但有旧缓存时，使用旧缓存并警告
+
+    Returns:
+        LOF 实时数据 DataFrame
+
+    Raises:
+        Exception: 无缓存且获取新数据失败时抛出异常
+    """
+
+    async def fetch_lof_data() -> pd.DataFrame:
+        """获取LOF数据"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, ak.fund_lof_spot_em)
+
+    cache_manager = _get_cache_manager()
+    ttl_minutes = _get_config_value("fund_cache_ttl_minutes", DEFAULT_CACHE_TTL_MINUTES)
+
+    return await cache_manager.lof_cache.get_or_update(
+        key="lof_spot_data", fetch_func=fetch_lof_data, ttl_minutes=ttl_minutes, data_type="LOF"
+    )
 
 
 async def get_fund_data(fund_code: str) -> dict:
@@ -202,8 +331,9 @@ async def get_market_fund_data(fund_code: str, fund_type: Literal["etf", "lof"])
             return {"success": False, "error": f"未找到{fund_type.upper()}基金代码"}
 
         # 获取历史数据
+        history_days = _get_config_value("fund_history_days", DEFAULT_HISTORY_DAYS)
         end_date = datetime.now().strftime("%Y%m%d")
-        start_date = (datetime.now() - timedelta(days=HISTORY_DAYS)).strftime("%Y%m%d")
+        start_date = (datetime.now() - timedelta(days=history_days)).strftime("%Y%m%d")
 
         loop = asyncio.get_event_loop()
         hist_df = await loop.run_in_executor(
@@ -269,8 +399,9 @@ async def get_stock_data(stock_code: str) -> dict:
             code = stock_code
 
         # 获取历史数据
+        history_days = _get_config_value("fund_history_days", DEFAULT_HISTORY_DAYS)
         end_date = datetime.now().strftime("%Y%m%d")
-        start_date = (datetime.now() - timedelta(days=HISTORY_DAYS)).strftime("%Y%m%d")
+        start_date = (datetime.now() - timedelta(days=history_days)).strftime("%Y%m%d")
 
         loop = asyncio.get_event_loop()
         hist_df = await loop.run_in_executor(
@@ -295,6 +426,48 @@ async def get_stock_data(stock_code: str) -> dict:
         return {"success": False, "error": str(e)}
 
 
+async def get_stock_name(stock_code: str) -> str:
+    """获取股票名称
+
+    Args:
+        stock_code: 股票代码 (如 "002170" 或 "002170.SZ")
+
+    Returns:
+        股票名称，获取失败时返回默认格式
+    """
+    # 输入验证
+    if not stock_code or not stock_code.strip():
+        logger.warning("股票代码为空")
+        return "未知股票"
+
+    try:
+        # 提取纯代码部分
+        code = stock_code.split(".")[0] if "." in stock_code else stock_code
+
+        # 验证代码格式（6位数字）
+        if not code.isdigit() or len(code) != 6:
+            logger.warning(f"无效的股票代码格式: {stock_code}")
+            return f"股票 {stock_code}"
+
+        # 使用现代的异步API（Python 3.9+）
+        stock_info_df = await asyncio.to_thread(ak.stock_individual_info_em, symbol=code)
+
+        if not stock_info_df.empty:
+            # 查找股票简称
+            name_row = stock_info_df[stock_info_df["item"] == "股票简称"]
+            if not name_row.empty:
+                stock_name = name_row.iloc[0]["value"]
+                logger.debug(f"获取股票名称成功: {code} -> {stock_name}")
+                return str(stock_name)
+
+        logger.warning(f"未找到股票 {code} 的名称信息")
+        return f"股票 {stock_code}"
+
+    except Exception as e:
+        logger.warning(f"获取股票名称失败 [{stock_code}]: {e}")
+        return f"股票 {stock_code}"
+
+
 async def format_stock_info(stock_code: str, stock_data: dict) -> str:
     """格式化股票信息文本
 
@@ -313,7 +486,9 @@ async def format_stock_info(stock_code: str, stock_data: dict) -> str:
 
         # 获取最新交易日数据
         latest = hist_df.iloc[-1]
-        stock_name = latest.get("股票名称", f"股票 {stock_code}")
+
+        # 获取股票名称
+        stock_name = await get_stock_name(stock_code)
 
         # 安全地获取数值数据
         try:
@@ -354,7 +529,8 @@ async def format_stock_info(stock_code: str, stock_data: dict) -> str:
         )
 
         # 添加最近交易日的涨跌幅
-        recent_hist = hist_df.tail(DISPLAY_RECENT_DAYS).iloc[::-1]
+        display_days = _get_config_value("fund_display_recent_days", DEFAULT_DISPLAY_RECENT_DAYS)
+        recent_hist = hist_df.tail(display_days).iloc[::-1]
         for _, row in recent_hist.iterrows():
             try:
                 date_str = row.get("日期", "")
@@ -426,7 +602,8 @@ async def format_etf_info(fund_code: str, etf_data: dict) -> str:
         )
 
         # 添加最近交易日的涨跌幅
-        recent_hist = hist_df.tail(DISPLAY_RECENT_DAYS).iloc[::-1]
+        display_days = _get_config_value("fund_display_recent_days", DEFAULT_DISPLAY_RECENT_DAYS)
+        recent_hist = hist_df.tail(display_days).iloc[::-1]
         for _, row in recent_hist.iterrows():
             try:
                 date_str = row.get("日期", "")
@@ -462,7 +639,8 @@ async def format_fund_info(fund_code: str, fund_data: dict) -> str:
             fund_name = f"基金 {fund_code}"
 
         # 获取最近交易日的数据
-        recent_nav = nav_df.tail(DISPLAY_RECENT_DAYS).iloc[::-1]
+        display_days = _get_config_value("fund_display_recent_days", DEFAULT_DISPLAY_RECENT_DAYS)
+        recent_nav = nav_df.tail(display_days).iloc[::-1]
 
         # 构建信息文本
         info_lines = [
@@ -581,6 +759,86 @@ async def send_forward_message(bot: Bot, event: MessageEvent, forward_nodes: lis
         )
 
 
+async def _query_off_market_fund(code: str) -> tuple[str | None, str | None]:
+    """查询场外基金数据
+
+    Args:
+        code: 基金代码
+
+    Returns:
+        (info_text, holdings_text) 元组
+    """
+    if not _get_config_value("fund_enable_off_market", True):
+        logger.warning(f"场外基金查询已禁用: {code}")
+        return None, None
+
+    fund_data = await get_fund_data(code)
+    if not fund_data["success"]:
+        logger.warning(f"场外基金数据获取失败: {code}")
+        return None, None
+
+    info_text = await format_fund_info(code, fund_data)
+
+    # 获取持仓数据
+    holdings_data = await get_fund_holdings(code)
+    holdings_text = None
+    if holdings_data["success"]:
+        holdings_text = await format_fund_holdings(code, holdings_data)
+    else:
+        logger.warning(f"获取基金持仓数据失败: {holdings_data.get('error', '未知错误')}")
+
+    return info_text, holdings_text
+
+
+async def _query_market_fund(
+    code: str, fund_type: Literal["etf", "lof"], type_name: str
+) -> tuple[str | None, str | None]:
+    """查询场内基金数据（ETF/LOF）
+
+    Args:
+        code: 基金代码
+        fund_type: 基金类型
+        type_name: 类型名称（用于日志）
+
+    Returns:
+        (info_text, None) 元组
+    """
+    config_key = f"fund_enable_{fund_type}"
+    if not _get_config_value(config_key, True):
+        logger.warning(f"{type_name}查询已禁用: {code}")
+        return None, None
+
+    fund_data = await get_market_fund_data(code, fund_type)
+    if not fund_data["success"]:
+        logger.warning(f"{type_name}数据获取失败: {code}")
+        return None, None
+
+    info_text = await format_etf_info(code, fund_data)
+    return info_text, None
+
+
+async def _query_stock(code: str) -> tuple[str | None, str | None]:
+    """查询股票数据
+
+    Args:
+        code: 股票代码
+
+    Returns:
+        (info_text, None) 元组
+    """
+    if not _get_config_value("fund_enable_stocks", True):
+        logger.warning(f"股票查询已禁用: {code}")
+        return None, None
+
+    stock_data = await get_stock_data(code)
+    if not stock_data["success"]:
+        logger.warning(f"股票数据获取失败: {code}")
+        return None, None
+
+    info_text = await format_stock_info(code, stock_data)
+    return info_text, None
+
+
 async def query_by_code_type(code: str, code_type: CodeType) -> tuple[str | None, str | None]:
     """根据代码类型查询数据并格式化
 
@@ -589,53 +847,35 @@ async def query_by_code_type(code: str, code_type: CodeType) -> tuple[str | None
         code_type: 代码类型
 
     Returns:
-        (info_text, holdings_text) 元组
+        (info_text, holdings_text) 元组，失败时返回 (None, None)
     """
-    info_text = None
-    holdings_text = None
+    try:
+        if code_type == CodeType.OFF_MARKET_FUND:
+            return await _query_off_market_fund(code)
+        if code_type == CodeType.ETF:
+            return await _query_market_fund(code, "etf", "ETF")
+        if code_type == CodeType.LOF:
+            return await _query_market_fund(code, "lof", "LOF")
+        if code_type == CodeType.STOCK:
+            return await _query_stock(code)
+        return None, None
 
-    if code_type == CodeType.OFF_MARKET_FUND:
-        # 场外基金
-        fund_data = await get_fund_data(code)
-        if not fund_data["success"]:
-            return None, None
-
-        info_text = await format_fund_info(code, fund_data)
-
-        # 获取持仓数据
-        holdings_data = await get_fund_holdings(code)
-        if holdings_data["success"]:
-            holdings_text = await format_fund_holdings(code, holdings_data)
-        else:
-            logger.warning(f"获取基金持仓数据失败: {holdings_data.get('error', '未知错误')}")
-
-    elif code_type == CodeType.ETF:
-        # 场内ETF
-        etf_data = await get_market_fund_data(code, "etf")
-        if not etf_data["success"]:
-            return None, None
-        info_text = await format_etf_info(code, etf_data)
-
-    elif code_type == CodeType.LOF:
-        # 场内LOF
-        lof_data = await get_market_fund_data(code, "lof")
-        if not lof_data["success"]:
-            return None, None
-        info_text = await format_etf_info(code, lof_data)
-
-    elif code_type == CodeType.STOCK:
-        # 个股
-        stock_data = await get_stock_data(code)
-        if not stock_data["success"]:
-            return None, None
-        info_text = await format_stock_info(code, stock_data)
-
-    return info_text, holdings_text
+    except Exception as e:
+        logger.error(f"查询{code_type.value}数据时发生错误 [{code}]: {e}", exc_info=True)
+        return None, None
 
 
 @fund_query.handle()
-async def handle_fund_query(bot: Bot, event: MessageEvent):
-    """处理基金/股票查询请求"""
+async def handle_fund_query(bot: Bot, event: MessageEvent) -> None:
+    """处理基金/股票查询请求
+
+    Args:
+        bot: Bot 实例
+        event: 消息事件
+
+    Returns:
+        None
+    """
     code = str(event.message).strip()
 
     try:
@@ -644,7 +884,7 @@ async def handle_fund_query(bot: Bot, event: MessageEvent):
 
         if code_type == CodeType.UNKNOWN:
             logger.info(f"未识别的代码类型: {code}")
-            return
+            return  # 静默失败
 
         # 查询数据
         info_text, holdings_text = await query_by_code_type(code, code_type)
@@ -653,9 +893,12 @@ async def handle_fund_query(bot: Bot, event: MessageEvent):
         if info_text:
             forward_nodes = await create_forward_nodes(bot, info_text, holdings_text)
             await send_forward_message(bot, event, forward_nodes)
+        else:
+            logger.warning(f"未能获取到数据: {code}")
+            # 静默失败，不发送任何消息
 
     except MatcherException:
         raise
     except Exception as e:
         logger.error(f"处理查询请求失败 [{code}]: {e}", exc_info=True)
-        return
+        # 静默失败，不发送任何消息
