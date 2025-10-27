@@ -83,6 +83,14 @@ def _get_cache_manager() -> FundDataCacheManager:
 # _lof_cache = {"data": None, "timestamp": None}  # 已废弃
 
 
+# ==================== Rule 检查函数 ====================
+
+
+async def is_fund_query_enabled() -> bool:
+    """检查基金查询插件是否启用"""
+    return _get_config_value("fund_plugin_enabled", True)
+
+
 class CodeType(Enum):
     """代码类型枚举"""
 
@@ -163,7 +171,11 @@ def identify_code_type(code: str) -> CodeType:
     return CodeType.UNKNOWN
 
 
-fund_query = on_regex(r"^(\d{6}|\d{6}\.(SZ|SH)|\d{8}\.BJ)$", re.IGNORECASE)
+fund_query = on_regex(
+    r"^(\d{6}|\d{6}\.(SZ|SH)|\d{8}\.BJ)$",
+    rule=is_fund_query_enabled,
+    flags=re.IGNORECASE,
+)
 
 
 def _normalize_etf_data_from_ths(df: pd.DataFrame) -> pd.DataFrame:
