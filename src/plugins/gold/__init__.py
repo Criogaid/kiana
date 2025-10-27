@@ -18,16 +18,37 @@ from .config import Config
 
 __plugin_meta__ = PluginMetadata(
     name="gold",
-    description="",
-    usage="",
+    description="实时黄金价格查询和走势图生成",
+    usage=(
+        "金价 - 查询当前金价\n"
+        "金价走势 [时间] - 查看金价走势图\n"
+        "时间格式: 1小时、24小时、7天、1月等"
+    ),
     config=Config,
 )
 
 config = get_plugin_config(Config)
 
-gold = on_fullmatch("金价")
+
+# ==================== Rule 检查函数 ====================
+
+
+async def is_price_query_enabled() -> bool:
+    """检查金价查询功能是否启用"""
+    return config.gold_plugin_enabled and config.gold_enable_price_query
+
+
+async def is_chart_enabled() -> bool:
+    """检查走势图功能是否启用"""
+    return config.gold_plugin_enabled and config.gold_enable_chart
+
+
+# ==================== 事件响应器 ====================
+
+gold = on_fullmatch("金价", rule=is_price_query_enabled)
 gold_chart = on_regex(
     r"^(金价走势|金价趋势|黄金走势|黄金趋势|金价图|黄金图)\s*(.*)$",
+    rule=is_chart_enabled,
     priority=5,
     block=True,
 )
@@ -117,6 +138,10 @@ async def fetch_gold_price() -> float | None:
 @scheduler.scheduled_job("interval", seconds=config.price_fetch_interval)
 async def record_price():
     """定时记录金价"""
+    # 检查插件是否启用
+    if not config.gold_plugin_enabled:
+        return
+
     current_time = time.time()
 
     price = await fetch_gold_price()
