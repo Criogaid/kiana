@@ -9,7 +9,13 @@ from datetime import datetime
 import aiohttp
 import matplotlib.pyplot as plt
 from nonebot import get_driver, get_plugin_config, logger, on_fullmatch, on_regex, require
-from nonebot.adapters.onebot.v11 import Bot, Event, MessageSegment
+from nonebot.adapters.onebot.v11 import (
+    Bot,
+    Event,
+    GroupMessageEvent,
+    MessageSegment,
+    PrivateMessageEvent,
+)
 from nonebot.params import RegexGroup
 from nonebot.plugin import PluginMetadata
 
@@ -202,13 +208,12 @@ def generate_chart(window_seconds: int | None = None) -> bytes:
     return buf.getvalue()
 
 
+# 群聊处理器（带冷却）
 @gold.handle()
-async def _(bot: Bot, event: Event):
-    # 获取当前时间
+async def handle_group_gold_query(bot: Bot, event: GroupMessageEvent) -> None:
+    """处理群聊金价查询（带冷却机制）"""
     current_time = time.time()
-
-    # 获取群号
-    group_id = event.group_id
+    group_id = event.group_id  # 类型安全：GroupMessageEvent 一定有 group_id
 
     # 检查是否在冷却时间内
     if (
@@ -221,7 +226,6 @@ async def _(bot: Bot, event: Event):
         if remaining_time == 0:
             remaining_time = 1
         await gold.finish(f"冷却中，请等待 {remaining_time} 秒后再试")
-        return
 
     price = await fetch_gold_price()
     if price is not None:
@@ -229,7 +233,17 @@ async def _(bot: Bot, event: Event):
         if group_id not in cooldown_dict:
             cooldown_dict[group_id] = {}
         cooldown_dict[group_id]["last_call_time"] = current_time
+        await gold.finish(f"{price}")
+    else:
+        await gold.finish("获取金价失败")
 
+
+# 私聊处理器（无冷却）
+@gold.handle()
+async def handle_private_gold_query(bot: Bot, event: PrivateMessageEvent) -> None:
+    """处理私聊金价查询（无冷却限制）"""
+    price = await fetch_gold_price()
+    if price is not None:
         await gold.finish(f"{price}")
     else:
         await gold.finish("获取金价失败")
