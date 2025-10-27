@@ -30,6 +30,7 @@ class Config(BaseModel):
     fund_enable_lof: bool = Field(default=True, description="是否启用LOF查询")
     fund_enable_stocks: bool = Field(default=True, description="是否启用股票查询")
     fund_enable_off_market: bool = Field(default=True, description="是否启用场外基金查询")
+    fund_enable_index: bool = Field(default=True, description="是否启用指数查询")
 
     # 数据源配置
     fund_enable_data_source_fallback: bool = Field(
