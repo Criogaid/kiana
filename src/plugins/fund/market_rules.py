@@ -15,7 +15,8 @@ from typing import Final
 # ==================== 股票市场前缀规则 ====================
 
 # 上海证券交易所（SSE）：使用三位前缀（更精确）
-STOCK_PREFIXES_SH: Final[tuple[str, ...]] = (
+# 使用 set 以实现 O(1) 查找性能（统一数据结构）
+STOCK_PREFIXES_SH: Final[set[str]] = {
     "600",  # SSE 主板 A 股
     "601",
     "603",
@@ -23,16 +24,17 @@ STOCK_PREFIXES_SH: Final[tuple[str, ...]] = (
     "688",  # 科创板
     "689",  # 科创板相关存托凭证/特殊号段
     "900",  # 补充：SSE B 股
-)
+}
 
 # 深圳证券交易所（SZSE）：使用三位前缀（更精确）
-STOCK_PREFIXES_SZ: Final[tuple[str, ...]] = (
+# 使用 set 以实现 O(1) 查找性能（统一数据结构）
+STOCK_PREFIXES_SZ: Final[set[str]] = {
     "000",  # 主板
     "001",  # 主板/互补号段
     "002",  # 主板（原中小板）
     "300",  # 创业板
     "200",  # 补充：SZSE B 股
-)
+}
 
 # 北京证券交易所（BSE）：使用两位前缀（北交所代码为8位数字，前两位标识）
 # 使用 set 以实现 O(1) 查找性能（用于 in 操作）
@@ -133,7 +135,7 @@ def is_shanghai_stock(code: str) -> bool:
     Returns:
         是否为上海股票
     """
-    return code.startswith(STOCK_PREFIXES_SH)
+    return code[:3] in STOCK_PREFIXES_SH
 
 
 def is_shenzhen_stock(code: str) -> bool:
@@ -145,7 +147,7 @@ def is_shenzhen_stock(code: str) -> bool:
     Returns:
         是否为深圳股票
     """
-    return code.startswith(STOCK_PREFIXES_SZ)
+    return code[:3] in STOCK_PREFIXES_SZ
 
 
 def is_beijing_stock(code: str) -> bool:
