@@ -1,4 +1,4 @@
-import http.client
+import asyncio
 import io
 import json
 import re
@@ -6,6 +6,7 @@ import time
 from collections import deque
 from datetime import datetime
 
+import aiohttp
 import matplotlib.pyplot as plt
 from nonebot import get_driver, get_plugin_config, logger, on_fullmatch, on_regex, require
 from nonebot.adapters.onebot.v11 import Bot, Event, MessageSegment
@@ -20,9 +21,7 @@ __plugin_meta__ = PluginMetadata(
     name="gold",
     description="实时黄金价格查询和走势图生成",
     usage=(
-        "金价 - 查询当前金价\n"
-        "金价走势 [时间] - 查看金价走势图\n"
-        "时间格式: 1小时、24小时、7天、1月等"
+        "金价 - 查询当前金价\n金价走势 [时间] - 查看金价走势图\n时间格式: 1小时、24小时、7天、1月等"
     ),
     config=Config,
 )
@@ -117,21 +116,44 @@ async def persist_price(timestamp: float, price: float) -> None:
 
 
 async def fetch_gold_price() -> float | None:
-    """获取金价"""
-    try:
-        conn = http.client.HTTPSConnection("mbmodule-openapi.paas.cmbchina.com")
-        payload = config.API_PAYLOAD
-        headers = config.API_HEADERS
-        conn.request("POST", config.API_URL, payload, headers)
-        res = conn.getresponse()
-        data = res.read()
+    """获取金价（aiohttp 异步版本）
 
-        json_data = json.loads(data.decode("utf-8"))
-        if json_data.get("success"):
-            return float(json_data["data"]["FQAMBPRCZ1"]["zBuyPrc"])
+    使用 aiohttp 进行异步 HTTP 请求，避免阻塞事件循环
+
+    Returns:
+        float | None: 金价，失败时返回 None
+    """
+    try:
+        # 设置 10 秒超时
+        timeout = aiohttp.ClientTimeout(total=10)
+
+        async with (
+            aiohttp.ClientSession(timeout=timeout) as session,
+            session.post(
+                config.API_URL, data=config.API_PAYLOAD, headers=config.API_HEADERS
+            ) as response,
+        ):
+            # 异步读取 JSON 响应
+            json_data = await response.json()
+
+            # 解析金价数据
+            if json_data.get("success"):
+                return float(json_data["data"]["FQAMBPRCZ1"]["zBuyPrc"])
+
+            logger.warning("API 返回 success=False")
+            return None
+
+    except aiohttp.ClientError as e:
+        logger.error(f"HTTP 请求失败: {e}")
         return None
-    except (OSError, http.client.HTTPException, json.JSONDecodeError, KeyError, ValueError) as e:
-        logger.error(f"获取金价失败: {e}")
+    except TimeoutError:
+        logger.error("获取金价超时（10秒）")
+        return None
+    except (KeyError, ValueError) as e:
+        logger.error(f"解析金价数据失败: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"获取金价失败（未知错误）: {e}", exc_info=True)
         return None
 
 
@@ -156,8 +178,8 @@ def generate_chart(window_seconds: int | None = None) -> bytes:
     plt.figure(figsize=(12, 6))
     plt.clf()
 
-    effective_window = CHART_WINDOW_SECONDS if window_seconds is None else max(
-        MIN_WINDOW_SECONDS, window_seconds
+    effective_window = (
+        CHART_WINDOW_SECONDS if window_seconds is None else max(MIN_WINDOW_SECONDS, window_seconds)
     )
     cutoff = time.time() - effective_window
     window_data = [(t, p) for t, p in price_history if t >= cutoff]
@@ -240,6 +262,8 @@ async def _(bot: Bot, event: Event, matches: tuple[str, str] = RegexGroup()):
 @driver.on_startup
 async def _():
     await load_price_history()
+
+
 WINDOW_PATTERN = re.compile(
     r"(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>分钟|分|min|m|小时|时|h|天|日|d|周|星期|w|月)",
     re.IGNORECASE,
