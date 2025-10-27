@@ -267,7 +267,12 @@ async def get_etf_spot_data_cached() -> pd.DataFrame:
             ttl_minutes=ttl_minutes,
             data_type="ETF(东方财富)",
         )
-    except Exception:
+    except Exception as e:
+        # 检查是否启用数据源切换
+        if not _get_config_value("fund_enable_data_source_fallback", True):
+            logger.error(f"东方财富 ETF 接口失败且数据源切换已禁用: {e}")
+            raise  # 直接抛出异常，不切换数据源
+
         # 主数据源失败，尝试备用数据源
         logger.warning("东方财富 ETF 接口失败，尝试备用数据源")
         return await cache_manager.etf_cache.get_or_update(
