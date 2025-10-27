@@ -37,6 +37,7 @@ __plugin_meta__ = PluginMetadata(
         "- 个股(需带交易所): 000001.SZ、600000.SH、43123456.BJ\n"
         "- 指数: 000001.SH、399001.SZ"
     ),
+    config=Config(),
 )
 
 
@@ -232,9 +233,6 @@ async def get_etf_spot_data_cached() -> pd.DataFrame:
 
     Returns:
         ETF 实时数据 DataFrame
-
-    Raises:
-        Exception: 所有数据源都失败且无缓存时抛出异常
     """
 
     async def fetch_etf_data_em() -> pd.DataFrame:
@@ -271,7 +269,7 @@ async def get_etf_spot_data_cached() -> pd.DataFrame:
         # 检查是否启用数据源切换
         if not _get_config_value("fund_enable_data_source_fallback", True):
             logger.error(f"东方财富 ETF 接口失败且数据源切换已禁用: {e}")
-            raise  # 直接抛出异常，不切换数据源
+            return None
 
         # 主数据源失败，尝试备用数据源
         logger.warning("东方财富 ETF 接口失败，尝试备用数据源")
@@ -294,9 +292,6 @@ async def get_lof_spot_data_cached() -> pd.DataFrame:
 
     Returns:
         LOF 实时数据 DataFrame
-
-    Raises:
-        Exception: 无缓存且获取新数据失败时抛出异常
     """
 
     async def fetch_lof_data() -> pd.DataFrame:
@@ -1132,7 +1127,7 @@ async def handle_fund_query(bot: Bot, event: MessageEvent) -> None:
             # 静默失败，不发送任何消息
 
     except MatcherException:
-        raise
+        return
     except Exception as e:
         logger.error(f"处理查询请求失败 [{code}]: {e}", exc_info=True)
         # 静默失败，不发送任何消息
