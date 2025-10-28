@@ -201,6 +201,7 @@ class FundDataCacheManager:
         self.lof_cache = SafeCache[Any](max_size)
         self.fund_cache = SafeCache[Any](max_size)
         self.stock_cache = SafeCache[Any](max_size)
+        self.index_cache = SafeCache[Any](max_size)
 
     async def get_cache_stats(self) -> dict[str, dict]:
         """获取所有缓存的统计信息"""
@@ -209,6 +210,7 @@ class FundDataCacheManager:
             "lof": await self.lof_cache.get_stats(),
             "fund": await self.fund_cache.get_stats(),
             "stock": await self.stock_cache.get_stats(),
+            "index": await self.index_cache.get_stats(),
         }
 
     async def clear_all_caches(self) -> None:
@@ -218,5 +220,6 @@ class FundDataCacheManager:
             self.lof_cache.clear(),
             self.fund_cache.clear(),
             self.stock_cache.clear(),
+            self.index_cache.clear(),
         )
         logger.info("所有基金数据缓存已清空")

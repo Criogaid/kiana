@@ -1,4 +1,4 @@
-import http.client
+import asyncio
 import io
 import json
 import re
@@ -6,9 +6,16 @@ import time
 from collections import deque
 from datetime import datetime
 
+import aiohttp
 import matplotlib.pyplot as plt
 from nonebot import get_driver, get_plugin_config, logger, on_fullmatch, on_regex, require
-from nonebot.adapters.onebot.v11 import Bot, Event, MessageSegment
+from nonebot.adapters.onebot.v11 import (
+    Bot,
+    Event,
+    GroupMessageEvent,
+    MessageSegment,
+    PrivateMessageEvent,
+)
 from nonebot.params import RegexGroup
 from nonebot.plugin import PluginMetadata
 
@@ -18,16 +25,35 @@ from .config import Config
 
 __plugin_meta__ = PluginMetadata(
     name="gold",
-    description="",
-    usage="",
+    description="实时黄金价格查询和走势图生成",
+    usage=(
+        "金价 - 查询当前金价\n金价走势 [时间] - 查看金价走势图\n时间格式: 1小时、24小时、7天、1月等"
+    ),
     config=Config,
 )
 
 config = get_plugin_config(Config)
 
-gold = on_fullmatch("金价")
+
+# ==================== Rule 检查函数 ====================
+
+
+async def is_price_query_enabled() -> bool:
+    """检查金价查询功能是否启用"""
+    return config.gold_plugin_enabled and config.gold_enable_price_query
+
+
+async def is_chart_enabled() -> bool:
+    """检查走势图功能是否启用"""
+    return config.gold_plugin_enabled and config.gold_enable_chart
+
+
+# ==================== 事件响应器 ====================
+
+gold = on_fullmatch("金价", rule=is_price_query_enabled)
 gold_chart = on_regex(
     r"^(金价走势|金价趋势|黄金走势|黄金趋势|金价图|黄金图)\s*(.*)$",
+    rule=is_chart_enabled,
     priority=5,
     block=True,
 )
@@ -96,27 +122,54 @@ async def persist_price(timestamp: float, price: float) -> None:
 
 
 async def fetch_gold_price() -> float | None:
-    """获取金价"""
-    try:
-        conn = http.client.HTTPSConnection("mbmodule-openapi.paas.cmbchina.com")
-        payload = config.API_PAYLOAD
-        headers = config.API_HEADERS
-        conn.request("POST", config.API_URL, payload, headers)
-        res = conn.getresponse()
-        data = res.read()
+    """获取金价（aiohttp 异步版本）
 
-        json_data = json.loads(data.decode("utf-8"))
-        if json_data.get("success"):
-            return float(json_data["data"]["FQAMBPRCZ1"]["zBuyPrc"])
+    使用 aiohttp 进行异步 HTTP 请求，避免阻塞事件循环
+
+    Returns:
+        float | None: 金价，失败时返回 None
+    """
+    try:
+        # 设置 10 秒超时
+        timeout = aiohttp.ClientTimeout(total=10)
+
+        async with (
+            aiohttp.ClientSession(timeout=timeout) as session,
+            session.post(
+                config.API_URL, data=config.API_PAYLOAD, headers=config.API_HEADERS
+            ) as response,
+        ):
+            # 异步读取 JSON 响应
+            json_data = await response.json()
+
+            # 解析金价数据
+            if json_data.get("success"):
+                return float(json_data["data"]["FQAMBPRCZ1"]["zBuyPrc"])
+
+            logger.warning("API 返回 success=False")
+            return None
+
+    except aiohttp.ClientError as e:
+        logger.error(f"HTTP 请求失败: {e}")
         return None
-    except (OSError, http.client.HTTPException, json.JSONDecodeError, KeyError, ValueError) as e:
-        logger.error(f"获取金价失败: {e}")
+    except TimeoutError:
+        logger.error("获取金价超时（10秒）")
+        return None
+    except (KeyError, ValueError) as e:
+        logger.error(f"解析金价数据失败: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"获取金价失败（未知错误）: {e}", exc_info=True)
         return None
 
 
 @scheduler.scheduled_job("interval", seconds=config.price_fetch_interval)
 async def record_price():
     """定时记录金价"""
+    # 检查插件是否启用
+    if not config.gold_plugin_enabled:
+        return
+
     current_time = time.time()
 
     price = await fetch_gold_price()
@@ -131,8 +184,8 @@ def generate_chart(window_seconds: int | None = None) -> bytes:
     plt.figure(figsize=(12, 6))
     plt.clf()
 
-    effective_window = CHART_WINDOW_SECONDS if window_seconds is None else max(
-        MIN_WINDOW_SECONDS, window_seconds
+    effective_window = (
+        CHART_WINDOW_SECONDS if window_seconds is None else max(MIN_WINDOW_SECONDS, window_seconds)
     )
     cutoff = time.time() - effective_window
     window_data = [(t, p) for t, p in price_history if t >= cutoff]
@@ -155,13 +208,12 @@ def generate_chart(window_seconds: int | None = None) -> bytes:
     return buf.getvalue()
 
 
+# 群聊处理器（带冷却）
 @gold.handle()
-async def _(bot: Bot, event: Event):
-    # 获取当前时间
+async def handle_group_gold_query(bot: Bot, event: GroupMessageEvent) -> None:
+    """处理群聊金价查询（带冷却机制）"""
     current_time = time.time()
-
-    # 获取群号
-    group_id = event.group_id
+    group_id = event.group_id  # 类型安全：GroupMessageEvent 一定有 group_id
 
     # 检查是否在冷却时间内
     if (
@@ -174,7 +226,6 @@ async def _(bot: Bot, event: Event):
         if remaining_time == 0:
             remaining_time = 1
         await gold.finish(f"冷却中，请等待 {remaining_time} 秒后再试")
-        return
 
     price = await fetch_gold_price()
     if price is not None:
@@ -182,7 +233,17 @@ async def _(bot: Bot, event: Event):
         if group_id not in cooldown_dict:
             cooldown_dict[group_id] = {}
         cooldown_dict[group_id]["last_call_time"] = current_time
+        await gold.finish(f"{price}")
+    else:
+        await gold.finish("获取金价失败")
 
+
+# 私聊处理器（无冷却）
+@gold.handle()
+async def handle_private_gold_query(bot: Bot, event: PrivateMessageEvent) -> None:
+    """处理私聊金价查询（无冷却限制）"""
+    price = await fetch_gold_price()
+    if price is not None:
         await gold.finish(f"{price}")
     else:
         await gold.finish("获取金价失败")
@@ -215,6 +276,8 @@ async def _(bot: Bot, event: Event, matches: tuple[str, str] = RegexGroup()):
 @driver.on_startup
 async def _():
     await load_price_history()
+
+
 WINDOW_PATTERN = re.compile(
     r"(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>分钟|分|min|m|小时|时|h|天|日|d|周|星期|w|月)",
     re.IGNORECASE,

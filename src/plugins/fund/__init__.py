@@ -14,11 +14,30 @@ from nonebot.plugin import PluginMetadata
 
 from .cache import FundDataCacheManager
 from .config import Config
+from .market_rules import (
+    infer_stock_market,
+    is_beijing_stock,
+    is_etf,
+    is_index,
+    is_lof,
+    is_off_market_fund,
+    is_shanghai_index,
+    is_shenzhen_index,
+    validate_market_code,
+)
 
 __plugin_meta__ = PluginMetadata(
     name="fund",
     description="基金查询插件",
-    usage="发送代码查询信息:\n- 场外基金: 018957、002170\n- 场内ETF: 510300、159915\n- 场内LOF: 163406、501018\n- 个股(需带交易所): 000001.SZ、600000.SH",
+    usage=(
+        "发送代码查询信息:\n"
+        "- 场外基金: 018957、002170\n"
+        "- 场内ETF: 510300、159915\n"
+        "- 场内LOF: 163406、501018\n"
+        "- 个股(需带交易所): 000001.SZ、600000.SH、43123456.BJ\n"
+        "- 指数: 000001.SH、399001.SZ"
+    ),
+    config=Config(),
 )
 
 
@@ -65,6 +84,14 @@ def _get_cache_manager() -> FundDataCacheManager:
 # _lof_cache = {"data": None, "timestamp": None}  # 已废弃
 
 
+# ==================== Rule 检查函数 ====================
+
+
+async def is_fund_query_enabled() -> bool:
+    """检查基金查询插件是否启用"""
+    return _get_config_value("fund_plugin_enabled", True)
+
+
 class CodeType(Enum):
     """代码类型枚举"""
 
@@ -72,6 +99,7 @@ class CodeType(Enum):
     ETF = "etf"  # 场内ETF基金
     LOF = "lof"  # 场内LOF基金
     STOCK = "stock"  # 股票
+    INDEX = "index"  # 指数
     UNKNOWN = "unknown"  # 未知类型
 
 
@@ -81,10 +109,12 @@ def identify_code_type(code: str) -> CodeType:
     规则说明:
     - 股票必须带交易所后缀 (.SZ/.SH/.BJ)
     - 纯6位数字按前缀分类:
-      * 51/58/56/55/15: 场内ETF (沪市/深市)
-      * 50/16: 场内LOF (沪市/深市)
+      * 000/999 (上海) 或 399 (深圳): 指数
+      * 51x/58x/56x/55x (上海) 或 15x (深圳): 场内ETF
+      * 50x/16x: 场内LOF
       * 00-09: 场外基金 (开放式基金)
       * 其他: 未知类型，需要权威查询
+    - 纯8位数字: 北交所股票（需带 .BJ 后缀）
 
     Args:
         code: 代码字符串
@@ -95,37 +125,46 @@ def identify_code_type(code: str) -> CodeType:
     # 移除可能的空格
     code = code.strip().upper()
 
-    # 带交易所后缀的格式 (如 000001.SZ, 600000.SH) -> 股票
-    if re.match(r"^\d{6}\.(SZ|SH|BJ)$", code):
+    # 带交易所后缀的格式 (如 000001.SZ, 600000.SH, 43123456.BJ)
+    if re.match(r"^\d{6,8}\.(SZ|SH|BJ)$", code):
+        pure_code = code.split(".")[0]
+        exchange = code.split(".")[1]
+
+        # 北交所股票：8位代码 + .BJ
+        if exchange == "BJ":
+            return CodeType.STOCK
+
+        # 6位代码：根据交易所判断是否为指数
+        if exchange == "SH" and is_shanghai_index(pure_code):
+            return CodeType.INDEX
+        if exchange == "SZ" and is_shenzhen_index(pure_code):
+            return CodeType.INDEX
+
+        # 其他带交易所后缀的都是股票
         return CodeType.STOCK
+
+    # 纯8位数字可能是北交所股票（但需要后缀确认）
+    if re.match(r"^\d{8}$", code):
+        return CodeType.UNKNOWN
 
     # 纯6位数字
     if not re.match(r"^\d{6}$", code):
         return CodeType.UNKNOWN
 
-    # 获取代码前两位
-    prefix = code[:2]
+    # 指数判断 (优先判断，避免与场外基金冲突) - 使用统一的市场规则
+    if is_index(code):
+        return CodeType.INDEX
 
-    # ETF前缀定义 (基于中国证券市场实际编码规则)
-    etf_prefixes_sh = {"51", "58", "56", "55"}  # 上交所ETF前缀
-    etf_prefixes_sz = {"15"}  # 深交所ETF前缀
-
-    # LOF前缀定义
-    lof_prefixes = {"16", "50"}  # LOF基金前缀
-
-    # 场外基金前缀定义 (主要是开放式基金)
-    offmarket_prefixes = {f"{i:02d}" for i in range(10)}  # "00"-"09"
-
-    # ETF判断 (场内ETF)
-    if prefix in etf_prefixes_sh or prefix in etf_prefixes_sz:
+    # ETF判断 (场内ETF) - 使用统一的市场规则
+    if is_etf(code):
         return CodeType.ETF
 
-    # LOF判断 (场内/场外双交易)
-    if prefix in lof_prefixes:
+    # LOF判断 (场内/场外双交易) - 使用统一的市场规则
+    if is_lof(code):
         return CodeType.LOF
 
-    # 场外基金判断 (开放式基金)
-    if prefix in offmarket_prefixes:
+    # 场外基金判断 (开放式基金) - 使用统一的市场规则
+    if is_off_market_fund(code):
         return CodeType.OFF_MARKET_FUND
 
     # 未知类型 (需要通过权威数据源查询)
@@ -133,7 +172,11 @@ def identify_code_type(code: str) -> CodeType:
     return CodeType.UNKNOWN
 
 
-fund_query = on_regex(r"^(\d{6}|\d{6}\.(SZ|SH|BJ))$", re.IGNORECASE)
+fund_query = on_regex(
+    r"^(\d{6}|\d{6}\.(SZ|SH)|\d{8}\.BJ)$",
+    rule=is_fund_query_enabled,
+    flags=re.IGNORECASE,
+)
 
 
 def _normalize_etf_data_from_ths(df: pd.DataFrame) -> pd.DataFrame:
@@ -190,9 +233,6 @@ async def get_etf_spot_data_cached() -> pd.DataFrame:
 
     Returns:
         ETF 实时数据 DataFrame
-
-    Raises:
-        Exception: 所有数据源都失败且无缓存时抛出异常
     """
 
     async def fetch_etf_data_em() -> pd.DataFrame:
@@ -225,7 +265,12 @@ async def get_etf_spot_data_cached() -> pd.DataFrame:
             ttl_minutes=ttl_minutes,
             data_type="ETF(东方财富)",
         )
-    except Exception:
+    except Exception as e:
+        # 检查是否启用数据源切换
+        if not _get_config_value("fund_enable_data_source_fallback", True):
+            logger.error(f"东方财富 ETF 接口失败且数据源切换已禁用: {e}")
+            return None
+
         # 主数据源失败，尝试备用数据源
         logger.warning("东方财富 ETF 接口失败，尝试备用数据源")
         return await cache_manager.etf_cache.get_or_update(
@@ -247,9 +292,6 @@ async def get_lof_spot_data_cached() -> pd.DataFrame:
 
     Returns:
         LOF 实时数据 DataFrame
-
-    Raises:
-        Exception: 无缓存且获取新数据失败时抛出异常
     """
 
     async def fetch_lof_data() -> pd.DataFrame:
@@ -394,9 +436,15 @@ async def get_stock_data(stock_code: str) -> dict:
             code, exchange = stock_code.split(".")
             market = exchange.lower()
         else:
-            # 根据代码前缀判断市场
-            market = "sh" if stock_code.startswith(("60", "68")) else "sz"
+            # 根据代码前缀推断市场
             code = stock_code
+            market = infer_stock_market(code)
+
+        # 验证市场和代码的匹配性
+        is_valid, error_msg = validate_market_code(code, market)
+        if not is_valid:
+            logger.warning(error_msg)
+            return {"success": False, "error": error_msg}
 
         # 获取历史数据
         history_days = _get_config_value("fund_history_days", DEFAULT_HISTORY_DAYS)
@@ -466,6 +514,163 @@ async def get_stock_name(stock_code: str) -> str:
     except Exception as e:
         logger.warning(f"获取股票名称失败 [{stock_code}]: {e}")
         return f"股票 {stock_code}"
+
+
+async def get_index_data(index_code: str) -> dict:
+    """获取指数数据
+
+    Args:
+        index_code: 指数代码（如 000001.SH 或 sh000001）
+
+    Returns:
+        包含指数历史数据的字典
+    """
+    try:
+        # 处理指数代码格式
+        if "." in index_code:
+            # 格式: 000001.SH -> sh000001
+            code, exchange = index_code.split(".")
+            market = exchange.lower()
+            symbol = f"{market}{code}"
+        # 推断市场
+        elif is_shanghai_index(index_code):
+            symbol = f"sh{index_code}"
+        elif is_shenzhen_index(index_code):
+            symbol = f"sz{index_code}"
+        else:
+            return {"success": False, "error": "无法识别的指数代码"}
+
+        # 获取历史数据（使用 stock_zh_index_daily_em API）
+        loop = asyncio.get_event_loop()
+        hist_df = await loop.run_in_executor(
+            None,
+            partial(
+                ak.stock_zh_index_daily_em,
+                symbol=symbol,
+            ),
+        )
+
+        if hist_df.empty or len(hist_df) < 2:
+            logger.warning(f"指数 {index_code} 历史数据不足")
+            return {"success": False, "error": "历史数据不足"}
+
+        return {"hist_data": hist_df, "symbol": symbol, "code": index_code, "success": True}
+    except Exception as e:
+        logger.error(f"获取指数数据失败 [{index_code}]: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
+async def format_index_info(index_code: str, index_data: dict) -> str:
+    """格式化指数信息文本
+
+    Args:
+        index_code: 指数代码
+        index_data: 指数数据字典
+
+    Returns:
+        格式化后的信息文本
+    """
+    try:
+        hist_df = index_data["hist_data"]
+
+        if hist_df.empty or len(hist_df) == 0:
+            return f"指数 {index_code}\n暂无数据"
+
+        # 获取最新交易日数据
+        latest = hist_df.iloc[-1]
+        previous = hist_df.iloc[-2] if len(hist_df) > 1 else None
+
+        # 安全地获取数值数据（列名是英文）
+        try:
+            latest_price = float(latest.get("close", 0))
+            open_price = float(latest.get("open", 0))
+            high = float(latest.get("high", 0))
+            low = float(latest.get("low", 0))
+
+            # 计算涨跌幅和涨跌额
+            if previous is not None:
+                previous_close = float(previous.get("close", 0))
+                change_amount = latest_price - previous_close
+                change_pct = (change_amount / previous_close * 100) if previous_close != 0 else 0
+            else:
+                change_amount = 0
+                change_pct = 0
+
+        except (ValueError, TypeError) as e:
+            logger.error(f"指数 {index_code} 数据转换失败: {e}")
+            return f"指数 {index_code}\n数据格式异常"
+
+        volume = latest.get("volume", "N/A")
+        amount = latest.get("amount", "N/A")
+        date_str = latest.get("date", "")
+
+        # 指数名称映射
+        index_names = {
+            "sh000001": "上证指数",
+            "sz399001": "深证成指",
+            "sh000300": "沪深300",
+            "sz399006": "创业板指",
+            "sz399005": "中小板指",
+            "sh000016": "上证50",
+            "sz399102": "创业板综",
+        }
+        symbol = index_data.get("symbol", "")
+        index_name = index_names.get(symbol, f"指数 {index_code}")
+
+        # 构建信息文本
+        info_lines = [
+            index_name,
+            f"代码: {index_code}",
+            "",
+            f"最新点位: {latest_price:.2f}",
+        ]
+
+        if change_pct > 0:
+            info_lines.append(f"涨跌幅: +{change_pct:.2f}% (+{change_amount:.2f})")
+        else:
+            info_lines.append(f"涨跌幅: {change_pct:.2f}% ({change_amount:.2f})")
+
+        info_lines.extend(
+            [
+                f"今开: {open_price:.2f}  最高: {high:.2f}  最低: {low:.2f}",
+                f"成交量: {volume}",
+                f"成交额: {amount}",
+                f"日期: {date_str}",
+                "",
+                "最近交易日涨跌:",
+            ]
+        )
+
+        # 添加最近交易日的涨跌幅
+        display_days = _get_config_value("fund_display_recent_days", DEFAULT_DISPLAY_RECENT_DAYS)
+        recent_hist = hist_df.tail(display_days).iloc[::-1]
+        for i, (_, row) in enumerate(recent_hist.iterrows()):
+            try:
+                date_str = row.get("date", "")
+                close_price = float(row.get("close", 0))
+
+                # 计算当日涨跌幅
+                if i < len(recent_hist) - 1:
+                    prev_close = float(recent_hist.iloc[i + 1].get("close", 0))
+                    if prev_close != 0:
+                        daily_change = (close_price - prev_close) / prev_close * 100
+                    else:
+                        daily_change = 0
+                else:
+                    daily_change = 0
+
+                if daily_change > 0:
+                    info_lines.append(f"{date_str}: +{daily_change:.2f}% ({close_price:.2f})")
+                else:
+                    info_lines.append(f"{date_str}: {daily_change:.2f}% ({close_price:.2f})")
+            except (ValueError, TypeError):
+                continue
+
+        return "\n".join(info_lines)
+
+    except Exception as e:
+        logger.error(f"格式化指数信息失败 [{index_code}]: {e}", exc_info=True)
+        return f"指数 {index_code}\n数据格式化失败: {e!s}"
 
 
 async def format_stock_info(stock_code: str, stock_data: dict) -> str:
@@ -839,6 +1044,28 @@ async def _query_stock(code: str) -> tuple[str | None, str | None]:
     return info_text, None
 
 
+async def _query_index(code: str) -> tuple[str | None, str | None]:
+    """查询指数数据
+
+    Args:
+        code: 指数代码
+
+    Returns:
+        (info_text, None) 元组
+    """
+    if not _get_config_value("fund_enable_index", True):
+        logger.warning(f"指数查询已禁用: {code}")
+        return None, None
+
+    index_data = await get_index_data(code)
+    if not index_data["success"]:
+        logger.warning(f"指数数据获取失败: {code}")
+        return None, None
+
+    info_text = await format_index_info(code, index_data)
+    return info_text, None
+
+
 async def query_by_code_type(code: str, code_type: CodeType) -> tuple[str | None, str | None]:
     """根据代码类型查询数据并格式化
 
@@ -858,6 +1085,8 @@ async def query_by_code_type(code: str, code_type: CodeType) -> tuple[str | None
             return await _query_market_fund(code, "lof", "LOF")
         if code_type == CodeType.STOCK:
             return await _query_stock(code)
+        if code_type == CodeType.INDEX:
+            return await _query_index(code)
         return None, None
 
     except Exception as e:
@@ -898,7 +1127,7 @@ async def handle_fund_query(bot: Bot, event: MessageEvent) -> None:
             # 静默失败，不发送任何消息
 
     except MatcherException:
-        raise
+        return
     except Exception as e:
         logger.error(f"处理查询请求失败 [{code}]: {e}", exc_info=True)
         # 静默失败，不发送任何消息
