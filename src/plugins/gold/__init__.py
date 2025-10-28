@@ -62,7 +62,7 @@ gold_chart = on_regex(
 cooldown_dict = {}
 
 PRICE_HISTORY_LIMIT = max(86400, config.price_history_limit)
-MIN_WINDOW_SECONDS = 60
+MIN_WINDOW_SECONDS = config.min_window_seconds
 CHART_WINDOW_SECONDS = max(MIN_WINDOW_SECONDS, config.chart_window_hours * 3600)
 price_history: deque[tuple[float, float]] = deque(maxlen=PRICE_HISTORY_LIMIT)
 
