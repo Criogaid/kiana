@@ -51,6 +51,16 @@ async def is_adding_nickname(event: GroupMessageEvent) -> bool:
     return has_at and text.startswith("昵称")
 
 
+async def is_replacing_nickname(event: GroupMessageEvent) -> bool:
+    """检查消息是否包含 'at' 关键字（昵称替换触发条件）
+
+    只有包含 'at' 关键字的消息才可能触发昵称替换，
+    避免每条消息都进行数据库查询，提升性能。
+    """
+    text = event.message.extract_plain_text()
+    return "at" in text
+
+
 add_nickname_matcher = on_message(rule=is_adding_nickname, priority=5, block=True)
 
 
@@ -184,7 +194,7 @@ async def clear_user_nicknames(group_id: str, user_id: str) -> list[str]:
 
 
 @add_nickname_matcher.handle()
-async def handle_add_nickname(event: GroupMessageEvent):
+async def handle_add_nickname(event: GroupMessageEvent) -> None:
     msg = event.message
     at_qq, nickname = extract_at_qq_and_nickname(msg)
 
@@ -216,11 +226,11 @@ async def handle_add_nickname(event: GroupMessageEvent):
         await add_nickname_matcher.finish(f"用户已有昵称'{nickname}'！")
 
 
-replace_nickname_matcher = on_message(priority=10, block=False)
+replace_nickname_matcher = on_message(rule=is_replacing_nickname, priority=10, block=False)
 
 
 @replace_nickname_matcher.handle()
-async def handle_replace_nickname(bot: Bot, event: GroupMessageEvent):
+async def handle_replace_nickname(bot: Bot, event: GroupMessageEvent) -> None:
     group_id = str(event.group_id)
     group_data = await fetch_group_nickname_map(group_id)
 
@@ -329,7 +339,7 @@ def build_delete_reply(success: list[str], not_found: list[str]) -> str:
 
 
 @delete_nickname_matcher.handle()
-async def handle_delete_nickname(event: GroupMessageEvent, bot: Bot):
+async def handle_delete_nickname(bot: Bot, event: GroupMessageEvent) -> None:
     msg = event.message
     text = msg.extract_plain_text().strip()
 
@@ -357,7 +367,7 @@ async def handle_delete_nickname(event: GroupMessageEvent, bot: Bot):
 
 
 @clear_nickname_matcher.handle()
-async def handle_clear_nickname(event: GroupMessageEvent, bot: Bot):
+async def handle_clear_nickname(bot: Bot, event: GroupMessageEvent) -> None:
     msg = event.message
     at_qq = None
 
