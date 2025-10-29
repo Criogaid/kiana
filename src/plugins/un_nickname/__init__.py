@@ -1,8 +1,9 @@
 import re
 import sqlite3
 from collections import defaultdict
+from time import time
 
-from nonebot import get_plugin_config, on_message
+from nonebot import get_plugin_config, logger, on_message
 from nonebot.adapters.onebot.v11 import (
     Bot,
     GroupMessageEvent,
@@ -42,6 +43,59 @@ db.ensure_schema(
         """,
     ]
 )
+
+# 昵称映射缓存: {group_id: (timestamp, {nickname: user_id})}
+_nickname_cache: dict[str, tuple[float, dict[str, str]]] = {}
+CACHE_TTL = 300  # 缓存过期时间：5分钟
+
+
+def _invalidate_cache(group_id: str) -> None:
+    """清除指定群组的昵称映射缓存
+
+    Args:
+        group_id: 群组ID
+    """
+    if group_id in _nickname_cache:
+        del _nickname_cache[group_id]
+        logger.debug(f"已清除群组 {group_id} 的昵称缓存")
+
+
+async def _get_cached_nickname_map(group_id: str) -> dict[str, str]:
+    """获取群组的昵称映射（带缓存）
+
+    如果缓存存在且未过期，直接返回缓存数据；
+    否则从数据库查询并更新缓存。
+
+    Args:
+        group_id: 群组ID
+
+    Returns:
+        昵称到用户ID的映射字典 {nickname: user_id}
+    """
+    now = time()
+
+    # 检查缓存是否存在且未过期
+    if group_id in _nickname_cache:
+        cached_time, cached_data = _nickname_cache[group_id]
+        if now - cached_time < CACHE_TTL:
+            logger.debug(f"使用群组 {group_id} 的昵称缓存")
+            return cached_data
+
+    # 缓存不存在或已过期，从数据库查询
+    logger.debug(f"从数据库查询群组 {group_id} 的昵称映射")
+    group_data = await fetch_group_nickname_map(group_id)
+
+    # 将 {user_id: [nickname1, nickname2]} 转换为 {nickname: user_id}
+    nickname_to_qq: dict[str, str] = {}
+    for user_id, nicknames in group_data.items():
+        for nickname in nicknames:
+            nickname_to_qq[nickname] = user_id
+
+    # 更新缓存
+    _nickname_cache[group_id] = (now, nickname_to_qq)
+    logger.debug(f"已缓存群组 {group_id} 的 {len(nickname_to_qq)} 个昵称映射")
+
+    return nickname_to_qq
 
 
 async def is_adding_nickname(event: GroupMessageEvent) -> bool:
@@ -115,6 +169,16 @@ async def nickname_occupied(group_id: str, nickname: str, user_id: str) -> bool:
 
 
 async def add_nickname_record(group_id: str, user_id: str, nickname: str) -> bool:
+    """添加昵称记录
+
+    Args:
+        group_id: 群组ID
+        user_id: 用户ID
+        nickname: 昵称
+
+    Returns:
+        是否添加成功（False 表示昵称已存在）
+    """
     try:
         await db.execute(
             """
@@ -123,6 +187,8 @@ async def add_nickname_record(group_id: str, user_id: str, nickname: str) -> boo
             """,
             (group_id, user_id, nickname),
         )
+        # 添加成功后清除缓存，确保下次查询获取最新数据
+        _invalidate_cache(group_id)
         return True
     except sqlite3.IntegrityError:
         return False
@@ -157,6 +223,16 @@ async def fetch_user_nicknames(group_id: str, user_id: str) -> list[str]:
 
 
 async def delete_single_nickname(group_id: str, user_id: str, nickname: str) -> bool:
+    """删除单个昵称
+
+    Args:
+        group_id: 群组ID
+        user_id: 用户ID
+        nickname: 要删除的昵称
+
+    Returns:
+        是否删除成功（False 表示昵称不存在）
+    """
     existing = await db.fetch_one(
         """
         SELECT 1 FROM nicknames
@@ -175,10 +251,21 @@ async def delete_single_nickname(group_id: str, user_id: str, nickname: str) -> 
         """,
         (group_id, user_id, nickname),
     )
+    # 删除成功后清除缓存，确保下次查询获取最新数据
+    _invalidate_cache(group_id)
     return True
 
 
 async def clear_user_nicknames(group_id: str, user_id: str) -> list[str]:
+    """清空用户的所有昵称
+
+    Args:
+        group_id: 群组ID
+        user_id: 用户ID
+
+    Returns:
+        被清空的昵称列表
+    """
     nicknames = await fetch_user_nicknames(group_id, user_id)
     if not nicknames:
         return []
@@ -190,6 +277,8 @@ async def clear_user_nicknames(group_id: str, user_id: str) -> list[str]:
         """,
         (group_id, user_id),
     )
+    # 清空成功后清除缓存，确保下次查询获取最新数据
+    _invalidate_cache(group_id)
     return nicknames
 
 
@@ -231,13 +320,15 @@ replace_nickname_matcher = on_message(rule=is_replacing_nickname, priority=10, b
 
 @replace_nickname_matcher.handle()
 async def handle_replace_nickname(bot: Bot, event: GroupMessageEvent) -> None:
-    group_id = str(event.group_id)
-    group_data = await fetch_group_nickname_map(group_id)
+    """处理昵称替换功能
 
-    nickname_to_qq: dict[str, str] = {}
-    for user_id, nicknames in group_data.items():
-        for nickname in nicknames:
-            nickname_to_qq[nickname] = user_id
+    自动将消息中的 'at昵称' 替换为实际的 @mentions。
+    使用内存缓存减少数据库查询，缓存时间为 5 分钟。
+    注意：C901 复杂度警告为原有代码，未来可考虑重构。
+    """
+    group_id = str(event.group_id)
+    # 使用缓存获取昵称映射，避免每次都查询数据库
+    nickname_to_qq = await _get_cached_nickname_map(group_id)
 
     original_msg = event.message
     new_msg = Message()
