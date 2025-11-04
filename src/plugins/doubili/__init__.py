@@ -11,6 +11,7 @@ from nonebot.exception import MatcherException
 from nonebot.plugin import PluginMetadata
 from nonebot.rule import Rule
 
+from ..group_permission import create_platform_rule
 from . import bilibili, douyin, xiaohongshu
 from .config import Config
 
@@ -24,9 +25,16 @@ __plugin_meta__ = PluginMetadata(
 config = get_plugin_config(Config)
 
 
+# 创建各平台的规则检查函数
+_bilibili_group_rule = create_platform_rule(lambda: config, "bilibili")
+_douyin_group_rule = create_platform_rule(lambda: config, "douyin")
+_xiaohongshu_group_rule = create_platform_rule(lambda: config, "xiaohongshu")
+
+
 async def is_bilibili_link(event: MessageEvent) -> bool:
     """检查是否为B站链接且B站解析已启用"""
-    if not config.enable_bilibili:
+    # 使用通用规则检查群权限和全局开关
+    if not await _bilibili_group_rule(event):
         return False
 
     message = str(event.message).strip()
@@ -88,7 +96,8 @@ async def handle_bilibili_message(bot: Bot, event: MessageEvent):
 
 async def is_douyin_link(event: MessageEvent) -> bool:
     """检查是否为抖音链接且抖音解析已启用"""
-    if not config.enable_douyin:
+    # 使用通用规则检查群权限和全局开关
+    if not await _douyin_group_rule(event):
         return False
 
     message = str(event.message).strip()
@@ -97,7 +106,8 @@ async def is_douyin_link(event: MessageEvent) -> bool:
 
 async def is_xiaohongshu_link(event: MessageEvent) -> bool:
     """检查是否为小红书链接且小红书解析已启用"""
-    if not config.enable_xiaohongshu:
+    # 使用通用规则检查群权限和全局开关
+    if not await _xiaohongshu_group_rule(event):
         return False
 
     message = str(event.message).strip()

@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import BaseModel
 
 
@@ -7,6 +9,22 @@ class Config(BaseModel):
     enable_douyin: bool = True
     enable_xiaohongshu: bool = True
     xiaohongshu_cookie: str = ""
+
+    # Bilibili 分群配置
+    bilibili_group_mode: Literal["all", "whitelist", "blacklist"] = "all"
+    bilibili_group_whitelist: list[str] = []
+    bilibili_group_blacklist: list[str] = []
+
+    # Douyin 分群配置
+    douyin_group_mode: Literal["all", "whitelist", "blacklist"] = "all"
+    douyin_group_whitelist: list[str] = []
+    douyin_group_blacklist: list[str] = []
+
+    # Xiaohongshu 分群配置
+    xiaohongshu_group_mode: Literal["all", "whitelist", "blacklist"] = "all"
+    xiaohongshu_group_whitelist: list[str] = []
+    xiaohongshu_group_blacklist: list[str] = []
+
     BILIBILI_API_URL: str = "https://api.bilibili.com/x/player/playurl"
     BILIBILI_VIEW_API_URL: str = "https://api.bilibili.com/x/web-interface/view"
 

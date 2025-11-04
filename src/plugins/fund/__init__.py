@@ -12,6 +12,7 @@ from nonebot.adapters.onebot.v11 import Bot, Event, GroupMessageEvent, MessageEv
 from nonebot.exception import MatcherException
 from nonebot.plugin import PluginMetadata
 
+from ..group_permission import create_group_rule
 from .cache import FundDataCacheManager
 from .config import Config
 from .market_rules import (
@@ -87,9 +88,12 @@ def _get_cache_manager() -> FundDataCacheManager:
 # ==================== Rule 检查函数 ====================
 
 
-async def is_fund_query_enabled() -> bool:
-    """检查基金查询插件是否启用"""
-    return _get_config_value("fund_plugin_enabled", True)
+# 创建群组规则检查函数
+fund_group_rule = create_group_rule(
+    config_getter=_get_plugin_config,
+    plugin_enabled_attr="fund_plugin_enabled",
+    prefix="fund_",
+)
 
 
 class CodeType(Enum):
@@ -174,7 +178,7 @@ def identify_code_type(code: str) -> CodeType:
 
 fund_query = on_regex(
     r"^(\d{6}|\d{6}\.(SZ|SH)|\d{8}\.BJ)$",
-    rule=is_fund_query_enabled,
+    rule=fund_group_rule,
     flags=re.IGNORECASE,
 )
 

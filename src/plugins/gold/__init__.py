@@ -21,6 +21,7 @@ from nonebot.plugin import PluginMetadata
 
 from src.storage import get_db
 
+from ..group_permission import create_sub_feature_rule
 from .config import Config
 
 __plugin_meta__ = PluginMetadata(
@@ -38,14 +39,20 @@ config = get_plugin_config(Config)
 # ==================== Rule 检查函数 ====================
 
 
-async def is_price_query_enabled() -> bool:
-    """检查金价查询功能是否启用"""
-    return config.gold_plugin_enabled and config.gold_enable_price_query
+# 创建金价查询和走势图的群组规则检查函数
+is_price_query_enabled = create_sub_feature_rule(
+    config_getter=lambda: config,
+    plugin_enabled_attr="gold_plugin_enabled",
+    feature_enabled_attr="gold_enable_price_query",
+    prefix="gold_",
+)
 
-
-async def is_chart_enabled() -> bool:
-    """检查走势图功能是否启用"""
-    return config.gold_plugin_enabled and config.gold_enable_chart
+is_chart_enabled = create_sub_feature_rule(
+    config_getter=lambda: config,
+    plugin_enabled_attr="gold_plugin_enabled",
+    feature_enabled_attr="gold_enable_chart",
+    prefix="gold_",
+)
 
 
 # ==================== 事件响应器 ====================
