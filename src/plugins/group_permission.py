@@ -15,8 +15,12 @@ class GroupPermissionMixin(BaseModel):
         default="all",
         description="群组控制模式: all(全部群启用) | whitelist(仅白名单群) | blacklist(黑名单外的群)",
     )
-    group_whitelist: list[str] = Field(default=[], description="白名单群组(仅在 whitelist 模式生效)")
-    group_blacklist: list[str] = Field(default=[], description="黑名单群组(仅在 blacklist 模式生效)")
+    group_whitelist: list[str] = Field(
+        default=[], description="白名单群组(仅在 whitelist 模式生效)"
+    )
+    group_blacklist: list[str] = Field(
+        default=[], description="黑名单群组(仅在 blacklist 模式生效)"
+    )
 
 
 def check_group_permission(
@@ -148,7 +152,9 @@ def create_sub_feature_rule(
         group_whitelist = getattr(config, whitelist_attr, [])
         group_blacklist = getattr(config, blacklist_attr, [])
 
-        return check_group_permission(event, plugin_enabled, group_mode, group_whitelist, group_blacklist)
+        return check_group_permission(
+            event, plugin_enabled, group_mode, group_whitelist, group_blacklist
+        )
 
     return sub_feature_rule
 

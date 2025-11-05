@@ -11,10 +11,15 @@ class Config(BaseModel):
 
     # 分群配置
     gold_group_mode: Literal["all", "whitelist", "blacklist"] = Field(
-        default="all", description="群组控制模式: all(全部群启用) | whitelist(仅白名单群) | blacklist(黑名单外的群)"
+        default="all",
+        description="群组控制模式: all(全部群启用) | whitelist(仅白名单群) | blacklist(黑名单外的群)",
     )
-    gold_group_whitelist: list[str] = Field(default=[], description="白名单群组(仅在 whitelist 模式生效)")
-    gold_group_blacklist: list[str] = Field(default=[], description="黑名单群组(仅在 blacklist 模式生效)")
+    gold_group_whitelist: list[str] = Field(
+        default=[], description="白名单群组(仅在 whitelist 模式生效)"
+    )
+    gold_group_blacklist: list[str] = Field(
+        default=[], description="黑名单群组(仅在 blacklist 模式生效)"
+    )
 
     # 功能配置
     cooldown_time: int = 1  # 冷却时间（秒）

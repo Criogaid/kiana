@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 
 class SQLiteManager:

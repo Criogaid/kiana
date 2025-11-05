@@ -4,6 +4,7 @@ import nonebot
 from nonebot import logger
 from nonebot.adapters.onebot.v11 import Adapter as ONEBOT_V11Adapter
 from nonebot.log import default_filter, default_format, logger_id
+
 from src.storage import get_db
 
 # 移除 NoneBot 默认的日志处理器
