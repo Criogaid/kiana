@@ -147,29 +147,40 @@ async def handle_douyin_message(bot: Bot, event: MessageEvent):
         await douyin_matcher.finish("未找到有效的抖音视频ID")
         return
 
+    video_data = None
+    video_segment = None
+
     try:
         video_info = await douyin.get_video_info(video_id)
         if isinstance(video_info, str):
             await douyin_matcher.finish(video_info)
             return
 
-        # 发送视频信息
         await douyin_matcher.send(f"{video_info['title']}")
 
-        # 下载并发送视频
         async with AsyncClient() as client:
             response = await client.get(video_info["url"], headers=video_info["headers"])
             response.raise_for_status()
 
             video_data = BytesIO(response.content)
             video_segment = MessageSegment.video(video_data)
+
+        try:
             await douyin_matcher.finish(video_segment)
+        except Exception as send_error:
+            error_str = str(send_error)
+            if "timeout" in error_str.lower() or "NetWorkError" in error_str:
+                logger.warning(f"发送视频时可能超时，但视频可能已发送: {send_error}")
+            else:
+                raise
 
     except MatcherException:
         raise
     except Exception as e:
         logger.error(f"处理抖音视频失败: {e}")
-        await douyin_matcher.finish(f"处理视频失败: {e}")
+        # 只有在视频还没准备好或下载失败时才发送错误消息
+        if video_segment is None:
+            await douyin_matcher.finish(f"处理视频失败: {e}")
 
 
 # 小红书消息匹配器
