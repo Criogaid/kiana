@@ -1,3 +1,4 @@
+import asyncio
 import re
 import sqlite3
 from collections import defaultdict
@@ -46,18 +47,22 @@ db.ensure_schema(
 
 # 昵称映射缓存: {group_id: (timestamp, {nickname: user_id})}
 _nickname_cache: dict[str, tuple[float, dict[str, str]]] = {}
+_cache_lock = asyncio.Lock()  # 缓存操作锁，防止并发竞争条件
 CACHE_TTL = 300  # 缓存过期时间：5分钟
 
 
-def _invalidate_cache(group_id: str) -> None:
+async def _invalidate_cache(group_id: str) -> None:
     """清除指定群组的昵称映射缓存
+
+    使用异步锁保护缓存操作，确保线程安全。
 
     Args:
         group_id: 群组ID
     """
-    if group_id in _nickname_cache:
-        del _nickname_cache[group_id]
-        logger.debug(f"已清除群组 {group_id} 的昵称缓存")
+    async with _cache_lock:
+        if group_id in _nickname_cache:
+            del _nickname_cache[group_id]
+            logger.debug(f"已清除群组 {group_id} 的昵称缓存")
 
 
 async def _get_cached_nickname_map(group_id: str) -> dict[str, str]:
@@ -65,6 +70,7 @@ async def _get_cached_nickname_map(group_id: str) -> dict[str, str]:
 
     如果缓存存在且未过期，直接返回缓存数据；
     否则从数据库查询并更新缓存。
+    使用异步锁保护缓存操作，确保线程安全。
 
     Args:
         group_id: 群组ID
@@ -72,30 +78,31 @@ async def _get_cached_nickname_map(group_id: str) -> dict[str, str]:
     Returns:
         昵称到用户ID的映射字典 {nickname: user_id}
     """
-    now = time()
+    async with _cache_lock:
+        now = time()
 
-    # 检查缓存是否存在且未过期
-    if group_id in _nickname_cache:
-        cached_time, cached_data = _nickname_cache[group_id]
-        if now - cached_time < CACHE_TTL:
-            logger.debug(f"使用群组 {group_id} 的昵称缓存")
-            return cached_data
+        # 检查缓存是否存在且未过期
+        if group_id in _nickname_cache:
+            cached_time, cached_data = _nickname_cache[group_id]
+            if now - cached_time < CACHE_TTL:
+                logger.debug(f"使用群组 {group_id} 的昵称缓存")
+                return cached_data
 
-    # 缓存不存在或已过期，从数据库查询
-    logger.debug(f"从数据库查询群组 {group_id} 的昵称映射")
-    group_data = await fetch_group_nickname_map(group_id)
+        # 缓存不存在或已过期，从数据库查询
+        logger.debug(f"从数据库查询群组 {group_id} 的昵称映射")
+        group_data = await fetch_group_nickname_map(group_id)
 
-    # 将 {user_id: [nickname1, nickname2]} 转换为 {nickname: user_id}
-    nickname_to_qq: dict[str, str] = {}
-    for user_id, nicknames in group_data.items():
-        for nickname in nicknames:
-            nickname_to_qq[nickname] = user_id
+        # 将 {user_id: [nickname1, nickname2]} 转换为 {nickname: user_id}
+        nickname_to_qq: dict[str, str] = {}
+        for user_id, nicknames in group_data.items():
+            for nickname in nicknames:
+                nickname_to_qq[nickname] = user_id
 
-    # 更新缓存
-    _nickname_cache[group_id] = (now, nickname_to_qq)
-    logger.debug(f"已缓存群组 {group_id} 的 {len(nickname_to_qq)} 个昵称映射")
+        # 更新缓存
+        _nickname_cache[group_id] = (now, nickname_to_qq)
+        logger.debug(f"已缓存群组 {group_id} 的 {len(nickname_to_qq)} 个昵称映射")
 
-    return nickname_to_qq
+        return nickname_to_qq
 
 
 async def is_adding_nickname(event: GroupMessageEvent) -> bool:
@@ -188,7 +195,7 @@ async def add_nickname_record(group_id: str, user_id: str, nickname: str) -> boo
             (group_id, user_id, nickname),
         )
         # 添加成功后清除缓存，确保下次查询获取最新数据
-        _invalidate_cache(group_id)
+        await _invalidate_cache(group_id)
         return True
     except sqlite3.IntegrityError:
         return False
@@ -252,7 +259,7 @@ async def delete_single_nickname(group_id: str, user_id: str, nickname: str) -> 
         (group_id, user_id, nickname),
     )
     # 删除成功后清除缓存，确保下次查询获取最新数据
-    _invalidate_cache(group_id)
+    await _invalidate_cache(group_id)
     return True
 
 
@@ -278,12 +285,12 @@ async def clear_user_nicknames(group_id: str, user_id: str) -> list[str]:
         (group_id, user_id),
     )
     # 清空成功后清除缓存，确保下次查询获取最新数据
-    _invalidate_cache(group_id)
+    await _invalidate_cache(group_id)
     return nicknames
 
 
 @add_nickname_matcher.handle()
-async def handle_add_nickname(event: GroupMessageEvent) -> None:
+async def handle_add_nickname(bot: Bot, event: GroupMessageEvent) -> None:
     msg = event.message
     at_qq, nickname = extract_at_qq_and_nickname(msg)
 
