@@ -98,6 +98,39 @@ class CodeType(Enum):
     UNKNOWN = "unknown"  # 未知类型
 
 
+def _identify_with_exchange_suffix(code: str, pure_code: str, exchange: str) -> CodeType:
+    """识别带交易所后缀的代码类型"""
+    # 北交所股票：8位代码 + .BJ
+    if exchange == "BJ":
+        return CodeType.STOCK
+
+    # 6位代码：根据交易所判断是否为指数
+    if (exchange == "SH" and is_shanghai_index(pure_code)) or (
+        exchange == "SZ" and is_shenzhen_index(pure_code)
+    ):
+        return CodeType.INDEX
+
+    # 其他带交易所后缀的都是股票
+    return CodeType.STOCK
+
+
+def _identify_six_digit_code(code: str) -> CodeType:
+    """识别6位数字代码类型"""
+    # 按优先级检查：指数 > ETF > LOF > 场外基金
+    type_checkers = [
+        (is_index, CodeType.INDEX),
+        (is_etf, CodeType.ETF),
+        (is_lof, CodeType.LOF),
+        (is_off_market_fund, CodeType.OFF_MARKET_FUND),
+    ]
+
+    for checker_func, code_type in type_checkers:
+        if checker_func(code):
+            return code_type
+
+    return CodeType.UNKNOWN
+
+
 def identify_code_type(code: str) -> CodeType:
     """识别代码类型
 
@@ -122,48 +155,18 @@ def identify_code_type(code: str) -> CodeType:
 
     # 带交易所后缀的格式 (如 000001.SZ, 600000.SH, 43123456.BJ)
     if re.match(r"^\d{6,8}\.(SZ|SH|BJ)$", code):
-        pure_code = code.split(".")[0]
-        exchange = code.split(".")[1]
-
-        # 北交所股票：8位代码 + .BJ
-        if exchange == "BJ":
-            return CodeType.STOCK
-
-        # 6位代码：根据交易所判断是否为指数
-        if exchange == "SH" and is_shanghai_index(pure_code):
-            return CodeType.INDEX
-        if exchange == "SZ" and is_shenzhen_index(pure_code):
-            return CodeType.INDEX
-
-        # 其他带交易所后缀的都是股票
-        return CodeType.STOCK
+        pure_code, exchange = code.split(".")
+        return _identify_with_exchange_suffix(code, pure_code, exchange)
 
     # 纯8位数字可能是北交所股票（但需要后缀确认）
     if re.match(r"^\d{8}$", code):
         return CodeType.UNKNOWN
 
-    # 纯6位数字
-    if not re.match(r"^\d{6}$", code):
-        return CodeType.UNKNOWN
+    # 纯6位数字 - 按优先级判断类型
+    if re.match(r"^\d{6}$", code):
+        return _identify_six_digit_code(code)
 
-    # 指数判断 (优先判断，避免与场外基金冲突) - 使用统一的市场规则
-    if is_index(code):
-        return CodeType.INDEX
-
-    # ETF判断 (场内ETF) - 使用统一的市场规则
-    if is_etf(code):
-        return CodeType.ETF
-
-    # LOF判断 (场内/场外双交易) - 使用统一的市场规则
-    if is_lof(code):
-        return CodeType.LOF
-
-    # 场外基金判断 (开放式基金) - 使用统一的市场规则
-    if is_off_market_fund(code):
-        return CodeType.OFF_MARKET_FUND
-
-    # 未知类型 (需要通过权威数据源查询)
-    # 这里不再使用兜底策略，避免错误分类
+    # 未知格式
     return CodeType.UNKNOWN
 
 
@@ -555,6 +558,131 @@ async def get_index_data(index_code: str) -> dict:
         return {"success": False, "error": str(e)}
 
 
+def _extract_price_data(latest: pd.Series, previous: pd.Series | None) -> dict | None:
+    """提取并计算价格数据
+
+    Args:
+        latest: 最新交易日数据
+        previous: 前一交易日数据
+
+    Returns:
+        包含价格信息的字典，如果数据异常则返回 None
+    """
+    try:
+        latest_price = float(latest.get("close", 0))
+        open_price = float(latest.get("open", 0))
+        high = float(latest.get("high", 0))
+        low = float(latest.get("low", 0))
+
+        # 计算涨跌幅和涨跌额
+        if previous is not None:
+            previous_close = float(previous.get("close", 0))
+            change_amount = latest_price - previous_close
+            change_pct = (change_amount / previous_close * 100) if previous_close != 0 else 0
+        else:
+            change_amount = 0
+            change_pct = 0
+
+        return {
+            "latest_price": latest_price,
+            "open_price": open_price,
+            "high": high,
+            "low": low,
+            "change_amount": change_amount,
+            "change_pct": change_pct,
+        }
+    except (ValueError, TypeError) as e:
+        logger.error(f"数据转换失败: {e}")
+        return None
+
+
+def _build_index_info_header(index_code: str, index_data: dict, price_data: dict, latest: pd.Series) -> list[str]:
+    """构建指数信息头部
+
+    Args:
+        index_code: 指数代码
+        index_data: 指数数据字典
+        price_data: 价格数据字典
+        latest: 最新交易日数据
+
+    Returns:
+        信息行列表
+    """
+    # 指数名称映射
+    index_names = {
+        "sh000001": "上证指数",
+        "sz399001": "深证成指",
+        "sh000300": "沪深300",
+        "sz399006": "创业板指",
+        "sz399005": "中小板指",
+        "sh000016": "上证50",
+        "sz399102": "创业板综",
+    }
+    symbol = index_data.get("symbol", "")
+    index_name = index_names.get(symbol, f"指数 {index_code}")
+
+    volume = latest.get("volume", "N/A")
+    amount = latest.get("amount", "N/A")
+    date_str = latest.get("date", "")
+
+    # 构建信息文本
+    info_lines = [
+        index_name,
+        f"代码: {index_code}",
+        "",
+        f"最新点位: {price_data['latest_price']:.2f}",
+    ]
+
+    # 添加涨跌幅信息
+    change_pct = price_data["change_pct"]
+    change_amount = price_data["change_amount"]
+    if change_pct > 0:
+        info_lines.append(f"涨跌幅: +{change_pct:.2f}% (+{change_amount:.2f})")
+    else:
+        info_lines.append(f"涨跌幅: {change_pct:.2f}% ({change_amount:.2f})")
+
+    info_lines.extend(
+        [
+            f"今开: {price_data['open_price']:.2f}  最高: {price_data['high']:.2f}  最低: {price_data['low']:.2f}",
+            f"成交量: {volume}",
+            f"成交额: {amount}",
+            f"日期: {date_str}",
+            "",
+            "最近交易日涨跌:",
+        ]
+    )
+
+    return info_lines
+
+
+def _add_recent_changes(info_lines: list[str], hist_df: pd.DataFrame) -> None:
+    """添加最近交易日涨跌幅信息
+
+    Args:
+        info_lines: 信息行列表（就地修改）
+        hist_df: 历史数据
+    """
+    display_days = _get_config_value("fund_display_recent_days", DEFAULT_DISPLAY_RECENT_DAYS)
+    recent_hist = hist_df.tail(display_days).iloc[::-1]
+
+    for i, (_, row) in enumerate(recent_hist.iterrows()):
+        try:
+            date_str = row.get("date", "")
+            close_price = float(row.get("close", 0))
+
+            # 计算当日涨跌幅
+            if i < len(recent_hist) - 1:
+                prev_close = float(recent_hist.iloc[i + 1].get("close", 0))
+                daily_change = (close_price - prev_close) / prev_close * 100 if prev_close != 0 else 0
+            else:
+                daily_change = 0
+
+            change_sign = "+" if daily_change > 0 else ""
+            info_lines.append(f"{date_str}: {change_sign}{daily_change:.2f}% ({close_price:.2f})")
+        except (ValueError, TypeError):
+            continue
+
+
 async def format_index_info(index_code: str, index_data: dict) -> str:
     """格式化指数信息文本
 
@@ -575,91 +703,16 @@ async def format_index_info(index_code: str, index_data: dict) -> str:
         latest = hist_df.iloc[-1]
         previous = hist_df.iloc[-2] if len(hist_df) > 1 else None
 
-        # 安全地获取数值数据（列名是英文）
-        try:
-            latest_price = float(latest.get("close", 0))
-            open_price = float(latest.get("open", 0))
-            high = float(latest.get("high", 0))
-            low = float(latest.get("low", 0))
-
-            # 计算涨跌幅和涨跌额
-            if previous is not None:
-                previous_close = float(previous.get("close", 0))
-                change_amount = latest_price - previous_close
-                change_pct = (change_amount / previous_close * 100) if previous_close != 0 else 0
-            else:
-                change_amount = 0
-                change_pct = 0
-
-        except (ValueError, TypeError) as e:
-            logger.error(f"指数 {index_code} 数据转换失败: {e}")
+        # 提取价格数据
+        price_data = _extract_price_data(latest, previous)
+        if price_data is None:
             return f"指数 {index_code}\n数据格式异常"
 
-        volume = latest.get("volume", "N/A")
-        amount = latest.get("amount", "N/A")
-        date_str = latest.get("date", "")
+        # 构建信息头部
+        info_lines = _build_index_info_header(index_code, index_data, price_data, latest)
 
-        # 指数名称映射
-        index_names = {
-            "sh000001": "上证指数",
-            "sz399001": "深证成指",
-            "sh000300": "沪深300",
-            "sz399006": "创业板指",
-            "sz399005": "中小板指",
-            "sh000016": "上证50",
-            "sz399102": "创业板综",
-        }
-        symbol = index_data.get("symbol", "")
-        index_name = index_names.get(symbol, f"指数 {index_code}")
-
-        # 构建信息文本
-        info_lines = [
-            index_name,
-            f"代码: {index_code}",
-            "",
-            f"最新点位: {latest_price:.2f}",
-        ]
-
-        if change_pct > 0:
-            info_lines.append(f"涨跌幅: +{change_pct:.2f}% (+{change_amount:.2f})")
-        else:
-            info_lines.append(f"涨跌幅: {change_pct:.2f}% ({change_amount:.2f})")
-
-        info_lines.extend(
-            [
-                f"今开: {open_price:.2f}  最高: {high:.2f}  最低: {low:.2f}",
-                f"成交量: {volume}",
-                f"成交额: {amount}",
-                f"日期: {date_str}",
-                "",
-                "最近交易日涨跌:",
-            ]
-        )
-
-        # 添加最近交易日的涨跌幅
-        display_days = _get_config_value("fund_display_recent_days", DEFAULT_DISPLAY_RECENT_DAYS)
-        recent_hist = hist_df.tail(display_days).iloc[::-1]
-        for i, (_, row) in enumerate(recent_hist.iterrows()):
-            try:
-                date_str = row.get("date", "")
-                close_price = float(row.get("close", 0))
-
-                # 计算当日涨跌幅
-                if i < len(recent_hist) - 1:
-                    prev_close = float(recent_hist.iloc[i + 1].get("close", 0))
-                    if prev_close != 0:
-                        daily_change = (close_price - prev_close) / prev_close * 100
-                    else:
-                        daily_change = 0
-                else:
-                    daily_change = 0
-
-                if daily_change > 0:
-                    info_lines.append(f"{date_str}: +{daily_change:.2f}% ({close_price:.2f})")
-                else:
-                    info_lines.append(f"{date_str}: {daily_change:.2f}% ({close_price:.2f})")
-            except (ValueError, TypeError):
-                continue
+        # 添加最近交易日涨跌幅
+        _add_recent_changes(info_lines, hist_df)
 
         return "\n".join(info_lines)
 
