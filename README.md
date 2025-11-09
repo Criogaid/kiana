@@ -39,6 +39,7 @@ services:
       HOST: "${HOST:-0.0.0.0}"
     volumes:
       - ./data:/app/data
+      - ./logs:/app/log
       - ./.env.prod:/app/.env.prod:ro
     restart: always
 ```

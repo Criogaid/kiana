@@ -17,4 +17,6 @@ COPY . /app/
 
 RUN uv sync --locked
 
+VOLUME ["/app/log"]
+
 CMD ["nb", "run"]
