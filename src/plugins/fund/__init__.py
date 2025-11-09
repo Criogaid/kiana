@@ -68,21 +68,12 @@ def _get_config_value(attr_name: str, default_value: Any) -> Any:
 
 
 # 延迟初始化缓存管理器
-_cache_manager = None
-
-
 def _get_cache_manager() -> FundDataCacheManager:
     """获取缓存管理器实例"""
-    global _cache_manager
-    if _cache_manager is None:
+    if not hasattr(_get_cache_manager, "_cache_manager"):
         max_size = _get_config_value("fund_max_cache_size", 100)
-        _cache_manager = FundDataCacheManager(max_size=max_size)
-    return _cache_manager
-
-
-# 旧的全局缓存变量已被线程安全的缓存管理器替代
-# _etf_cache = {"data": None, "timestamp": None}  # 已废弃
-# _lof_cache = {"data": None, "timestamp": None}  # 已废弃
+        _get_cache_manager._cache_manager = FundDataCacheManager(max_size=max_size)
+    return _get_cache_manager._cache_manager
 
 
 # ==================== Rule 检查函数 ====================
