@@ -12,6 +12,8 @@ from typing import Any
 class SQLiteManager:
     """Serialize SQLite access across async code paths."""
 
+    _instance: SQLiteManager | None = None
+
     def __init__(self, db_path: Path):
         self._db_path = db_path
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -66,15 +68,10 @@ class SQLiteManager:
         return result
 
 
-_DB_INSTANCE: SQLiteManager | None = None
-
-
 def get_db() -> SQLiteManager:
     """Return the singleton SQLite manager instance."""
-
-    global _DB_INSTANCE
-    if _DB_INSTANCE is None:
+    if SQLiteManager._instance is None:
         project_root = Path(__file__).resolve().parents[2]
         db_path = project_root / "data" / "kiana.sqlite3"
-        _DB_INSTANCE = SQLiteManager(db_path)
-    return _DB_INSTANCE
+        SQLiteManager._instance = SQLiteManager(db_path)
+    return SQLiteManager._instance
