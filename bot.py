@@ -21,21 +21,21 @@ logger.add(
 
 # 修改日志轮转配置
 logger.add(
-    "log/info.log",
+    "log/info_{time:YYYY-MM-DD}.log",
     level="INFO",
     format=default_format,
     rotation="00:00",
     retention="30 days",
 )
 logger.add(
-    "log/debug.log",
+    "log/debug_{time:YYYY-MM-DD}.log",
     level="DEBUG",
     format=default_format,
     rotation="00:00",
     retention="7 days",
 )
 logger.add(
-    "log/error.log",
+    "log/error_{time:YYYY-MM-DD}.log",
     level="ERROR",
     format=default_format,
     rotation="00:00",
