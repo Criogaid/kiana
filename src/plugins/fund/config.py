@@ -1,4 +1,4 @@
-from typing import ClassVar, Literal
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -43,9 +43,3 @@ class Config(BaseModel):
     fund_enable_data_source_fallback: bool = Field(
         default=True, description="是否启用数据源切换（东方财富→同花顺）"
     )
-
-    class Config:
-        extra = "ignore"  # 忽略未定义的配置项
-        json_encoders: ClassVar[dict] = {
-            # 可以添加自定义编码器
-        }

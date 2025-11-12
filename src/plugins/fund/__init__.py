@@ -596,7 +596,9 @@ def _extract_price_data(latest: pd.Series, previous: pd.Series | None) -> dict |
         return None
 
 
-def _build_index_info_header(index_code: str, index_data: dict, price_data: dict, latest: pd.Series) -> list[str]:
+def _build_index_info_header(
+    index_code: str, index_data: dict, price_data: dict, latest: pd.Series
+) -> list[str]:
     """构建指数信息头部
 
     Args:
@@ -673,7 +675,9 @@ def _add_recent_changes(info_lines: list[str], hist_df: pd.DataFrame) -> None:
             # 计算当日涨跌幅
             if i < len(recent_hist) - 1:
                 prev_close = float(recent_hist.iloc[i + 1].get("close", 0))
-                daily_change = (close_price - prev_close) / prev_close * 100 if prev_close != 0 else 0
+                daily_change = (
+                    (close_price - prev_close) / prev_close * 100 if prev_close != 0 else 0
+                )
             else:
                 daily_change = 0
 
