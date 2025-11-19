@@ -1,26 +1,15 @@
 import json
 import re
-from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from httpx import AsyncClient
 from nonebot import get_plugin_config, logger
 
+from .base_parser import ParseResult
 from .config import Config
 
 config = get_plugin_config(Config)
-
-
-@dataclass
-class ParseResult:
-    """解析结果"""
-
-    title: str
-    cover_url: str
-    video_url: str = ""
-    pic_urls: list[str] = None
-    author: str = ""
 
 
 # 匹配小红书链接的模式
@@ -51,13 +40,29 @@ XHS_HEADERS = {
 
 
 class XiaoHongShuParser:
-    """小红书解析器"""
+    """小红书解析器
+
+    使用单例模式确保只有一个实例，避免重复初始化。
+    """
+
+    _instance: "XiaoHongShuParser | None" = None
 
     def __init__(self):
         self.headers = XHS_HEADERS.copy()
         # 如果配置了cookie，添加到请求头中
         if config.xiaohongshu_cookie:
             self.headers["cookie"] = config.xiaohongshu_cookie
+
+    @classmethod
+    def get_instance(cls) -> "XiaoHongShuParser":
+        """获取单例实例
+
+        Returns:
+            XiaoHongShuParser单例
+        """
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
 
     async def _get_redirect_url(self, url: str) -> str:
         """获取重定向后的URL"""
@@ -188,12 +193,20 @@ class XiaoHongShuParser:
             # 解析媒体内容
             img_urls, video_url = self._parse_media_content(note_data)
 
+            # 根据内容类型设置media_urls和media_type
+            if video_url:
+                media_urls = [video_url]
+                media_type = "video"
+            else:
+                media_urls = img_urls
+                media_type = "images"
+
             return ParseResult(
                 title=title_desc,
-                cover_url="",
-                video_url=video_url,
-                pic_urls=img_urls,
                 author=author,
+                media_urls=media_urls,
+                media_type=media_type,
+                cover_url="",
             )
 
         except Exception as e:
@@ -224,11 +237,20 @@ async def get_note_info(url: str) -> dict | str:
     """
     try:
         result = await xiaohongshu_parser.parse_url(url)
+        
+        # 根据 media_type 提取 video_url 或 pic_urls
+        if result.media_type == "video":
+            video_url = result.media_urls[0] if result.media_urls else ""
+            pic_urls = []
+        else:  # images
+            video_url = ""
+            pic_urls = result.media_urls
+        
         return {
             "title": result.title,
             "author": result.author,
-            "video_url": result.video_url,
-            "pic_urls": result.pic_urls or [],
+            "video_url": video_url,
+            "pic_urls": pic_urls,
             "cover_url": result.cover_url,
         }
     except Exception as e:

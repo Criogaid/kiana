@@ -1,4 +1,6 @@
+import json
 import re
+from urllib.parse import unquote
 
 from httpx import AsyncClient
 from nonebot import get_plugin_config, logger
@@ -29,10 +31,11 @@ async def get_redirect_url(url: str, headers: dict) -> str:
 async def _extract_from_json(text: str) -> tuple[str, str]:
     """从JSON小程序中提取视频ID"""
     try:
-        import json
-        from urllib.parse import unquote
-
-        json_str = re.search(r"\[CQ:json,data=(.*?)\]", text)
+        # 增强的JSON解析，支持多种转义格式
+        json_pattern = r"\[CQ:json,data=([^\]]+)\]"
+        json_str = re.search(json_pattern, text)
+        if not json_str:
+            return "", ""
         json_data = json.loads(unquote(json_str.group(1).replace("&#44;", ",")))
         detail = json_data["meta"]["detail_1"]
         if "qqdocurl" in detail:

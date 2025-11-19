@@ -1,23 +1,11 @@
 import json
 import re
-from dataclasses import dataclass
 from typing import Any
 
 from httpx import AsyncClient
 from nonebot import logger
 
-
-@dataclass
-class ParseResult:
-    """解析结果"""
-
-    title: str
-    cover_url: str
-    video_url: str = ""
-    pic_urls: list[str] = None
-    dynamic_urls: list[str] = None
-    author: str = ""
-
+from .base_parser import ParseResult
 
 IOS_HEADER = {
     "Accept": "application/json, text/plain, */*",
@@ -37,9 +25,27 @@ PATTERNS = {
 
 
 class DouyinParser:
+    """抖音解析器
+
+    使用单例模式确保只有一个实例，避免重复初始化。
+    """
+
+    _instance: "DouyinParser | None" = None
+
     def __init__(self):
         self.ios_headers = IOS_HEADER.copy()
         self.android_headers = {"Accept": "application/json, text/plain, */*", **ANDROID_HEADER}
+
+    @classmethod
+    def get_instance(cls) -> "DouyinParser":
+        """获取单例实例
+
+        Returns:
+            DouyinParser单例
+        """
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
 
     def _build_iesdouyin_url(self, _type: str, video_id: str) -> str:
         return f"https://www.iesdouyin.com/share/{_type}/{video_id}"
@@ -54,7 +60,7 @@ class DouyinParser:
             video_info = await self.parse_share_url(share_url)
 
             return {
-                "url": video_info.video_url,
+                "url": video_info.media_urls[0] if video_info.media_urls else "",
                 "headers": self.ios_headers,
                 "title": video_info.title,
             }
@@ -77,9 +83,10 @@ class DouyinParser:
 
         return ParseResult(
             title=data["desc"],
-            cover_url=data["video"]["cover"]["url_list"][0],
-            video_url=video_url,
             author=data["author"]["nickname"],
+            media_urls=[video_url] if video_url else [],
+            media_type="video",
+            cover_url=data["video"]["cover"]["url_list"][0],
         )
 
     def _format_response(self, text: str) -> dict[str, Any]:
@@ -155,9 +162,10 @@ class DouyinParser:
 
             return ParseResult(
                 title=data["desc"],
-                cover_url=data["video"]["cover"]["url_list"][0],
-                video_url=video_url,
                 author=data["author"]["nickname"],
+                media_urls=[video_url] if video_url else [],
+                media_type="video",
+                cover_url=data["video"]["cover"]["url_list"][0],
             )
         except Exception as e:
             logger.error(f"解析抖音视频失败: {e}")
@@ -197,9 +205,10 @@ async def get_video_info(video_id: str) -> dict | str:
     try:
         share_url = f"https://www.douyin.com/video/{video_id}"
         video_info = await douyin_parser.parse_share_url(share_url)
-        logger.info(f"获取到视频信息: {video_info.video_url}")
+        video_url = video_info.media_urls[0] if video_info.media_urls else ""
+        logger.info(f"获取到视频信息: {video_url}")
 
-        return {"url": video_info.video_url, "headers": IOS_HEADER, "title": video_info.title}
+        return {"url": video_url, "headers": IOS_HEADER, "title": video_info.title}
     except Exception as e:
         logger.error(f"解析抖音视频失败: {e}")
         return f"获取视频信息失败: {e!s}"
