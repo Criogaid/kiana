@@ -32,11 +32,9 @@ nb run
 services:
   kiana:
     container_name: kiana
-    image: ghcr.exusiai.top/haukuen/kiana:latest
+    image: ghcr.io/haukuen/kiana:latest
     ports:
-      - "${PORT:-8080}:${PORT:-8080}"
-    environment:
-      HOST: "${HOST:-0.0.0.0}"
+      - "8080:8080"
     volumes:
       - ./data:/app/data
       - ./logs:/app/log
