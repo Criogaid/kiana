@@ -10,6 +10,7 @@ RUN apt-get update && \
 RUN pip3 --no-cache-dir install nb-cli
 
 ENV TZ=Asia/Shanghai
+ENV HOST=0.0.0.0
 
 WORKDIR /app
 
