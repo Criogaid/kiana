@@ -687,7 +687,7 @@ def _add_recent_changes(info_lines: list[str], hist_df: pd.DataFrame) -> None:
             continue
 
 
-async def format_index_info(index_code: str, index_data: dict) -> str:
+def format_index_info(index_code: str, index_data: dict) -> str:
     """格式化指数信息文本
 
     Args:
@@ -808,7 +808,7 @@ async def format_stock_info(stock_code: str, stock_data: dict) -> str:
         return f"股票 {stock_code}\n数据格式化失败: {e!s}"
 
 
-async def format_etf_info(fund_code: str, etf_data: dict) -> str:
+def format_etf_info(fund_code: str, etf_data: dict) -> str:
     """格式化场内ETF/LOF基金信息文本
 
     Args:
@@ -881,7 +881,7 @@ async def format_etf_info(fund_code: str, etf_data: dict) -> str:
         return f"基金 {fund_code}\n数据格式化失败: {e!s}"
 
 
-async def format_fund_info(fund_code: str, fund_data: dict) -> str:
+def format_fund_info(fund_code: str, fund_data: dict) -> str:
     """格式化基金信息文本"""
     try:
         basic_info_df = fund_data["basic_info"]
@@ -940,7 +940,7 @@ async def format_fund_info(fund_code: str, fund_data: dict) -> str:
         return f"基金 {fund_code}\n数据格式化失败: {e!s}"
 
 
-async def format_fund_holdings(fund_code: str, holdings_data: dict) -> str:
+def format_fund_holdings(fund_code: str, holdings_data: dict) -> str:
     """格式化基金十大重仓股信息"""
     try:
         holdings_df = holdings_data["holdings"]
@@ -974,7 +974,7 @@ async def format_fund_holdings(fund_code: str, holdings_data: dict) -> str:
         return f"基金 {fund_code}\n持仓数据格式化失败: {e!s}"
 
 
-async def create_forward_nodes(
+def create_forward_nodes(
     bot: Bot,
     info_text: str,
     holdings_text: str | None = None,
@@ -1034,13 +1034,13 @@ async def _query_off_market_fund(code: str) -> tuple[str | None, str | None]:
         logger.warning(f"场外基金数据获取失败: {code}")
         return None, None
 
-    info_text = await format_fund_info(code, fund_data)
+    info_text = format_fund_info(code, fund_data)
 
     # 获取持仓数据
     holdings_data = await get_fund_holdings(code)
     holdings_text = None
     if holdings_data["success"]:
-        holdings_text = await format_fund_holdings(code, holdings_data)
+        holdings_text = format_fund_holdings(code, holdings_data)
     else:
         logger.warning(f"获取基金持仓数据失败: {holdings_data.get('error', '未知错误')}")
 
@@ -1070,7 +1070,7 @@ async def _query_market_fund(
         logger.warning(f"{type_name}数据获取失败: {code}")
         return None, None
 
-    info_text = await format_etf_info(code, fund_data)
+    info_text = format_etf_info(code, fund_data)
     return info_text, None
 
 
@@ -1114,7 +1114,7 @@ async def _query_index(code: str) -> tuple[str | None, str | None]:
         logger.warning(f"指数数据获取失败: {code}")
         return None, None
 
-    info_text = await format_index_info(code, index_data)
+    info_text = format_index_info(code, index_data)
     return info_text, None
 
 
@@ -1172,7 +1172,7 @@ async def handle_fund_query(bot: Bot, event: MessageEvent) -> None:
 
         # 创建并发送合并转发消息
         if info_text:
-            forward_nodes = await create_forward_nodes(bot, info_text, holdings_text)
+            forward_nodes = create_forward_nodes(bot, info_text, holdings_text)
             await send_forward_message(bot, event, forward_nodes)
         else:
             logger.warning(f"未能获取到数据: {code}")

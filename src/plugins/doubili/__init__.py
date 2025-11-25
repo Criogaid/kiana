@@ -292,7 +292,7 @@ async def send_forward_message(bot: Bot, event: MessageEvent, forward_nodes: lis
         )
 
 
-async def create_forward_nodes(
+def create_forward_nodes(
     bot: Bot, info_text: str, media_segments: list[MessageSegment] | None = None
 ) -> list[dict]:
     """创建合并转发消息节点"""
@@ -346,7 +346,7 @@ async def handle_xiaohongshu_message(bot: Bot, event: MessageEvent):
             logger.info(f"图片数量{len(pic_urls)}张，合并转发所有图片")
 
             image_segments = await download_images(pic_urls)
-            forward_nodes = await create_forward_nodes(bot, info_text, image_segments)
+            forward_nodes = create_forward_nodes(bot, info_text, image_segments)
             await send_forward_message(bot, event, forward_nodes)
 
         elif note_info["video_url"]:
@@ -356,12 +356,12 @@ async def handle_xiaohongshu_message(bot: Bot, event: MessageEvent):
                 video_data = BytesIO(response.content)
                 video_segment = MessageSegment.video(video_data)
 
-            forward_nodes = await create_forward_nodes(bot, info_text, [video_segment])
+            forward_nodes = create_forward_nodes(bot, info_text, [video_segment])
             await send_forward_message(bot, event, forward_nodes)
 
         else:
             # 处理纯文字内容
-            forward_nodes = await create_forward_nodes(bot, info_text)
+            forward_nodes = create_forward_nodes(bot, info_text)
             await send_forward_message(bot, event, forward_nodes)
 
     except MatcherException:

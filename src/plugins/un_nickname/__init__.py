@@ -89,14 +89,14 @@ async def _get_cached_nickname_map(group_id: str) -> dict[str, str]:
         return nickname_to_qq
 
 
-async def is_adding_nickname(event: GroupMessageEvent) -> bool:
+def is_adding_nickname(event: GroupMessageEvent) -> bool:
     msg = event.message
     has_at = any(seg.type == "at" for seg in msg)
     text = msg.extract_plain_text().strip()
     return has_at and text.startswith("昵称")
 
 
-async def is_replacing_nickname(event: GroupMessageEvent) -> bool:
+def is_replacing_nickname(event: GroupMessageEvent) -> bool:
     """检查消息是否包含 'at' 关键字"""
     text = event.message.extract_plain_text()
     return "at" in text
@@ -317,13 +317,13 @@ async def handle_replace_nickname(bot: Bot, event: GroupMessageEvent) -> None:
         await bot.send(event, new_msg)
 
 
-async def is_deleting_nickname(event: GroupMessageEvent) -> bool:
+def is_deleting_nickname(event: GroupMessageEvent) -> bool:
     msg = event.message
     text = msg.extract_plain_text().strip()
     return text.startswith(("删除昵称", "移除昵称")) and any(seg.type == "at" for seg in msg)
 
 
-async def is_clearing_nickname(event: GroupMessageEvent) -> bool:
+def is_clearing_nickname(event: GroupMessageEvent) -> bool:
     msg = event.message
     text = msg.extract_plain_text().strip()
     return text.startswith(("清空昵称", "清除昵称")) and any(seg.type == "at" for seg in msg)

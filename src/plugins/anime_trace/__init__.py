@@ -23,7 +23,7 @@ config = get_plugin_config(Config)
 
 
 def has_image() -> Rule:
-    async def _has_image(event: MessageEvent) -> bool:
+    def _has_image(event: MessageEvent) -> bool:
         if event.reply:
             # 检查回复的消息中是否包含图片
             for seg in event.reply.message:
