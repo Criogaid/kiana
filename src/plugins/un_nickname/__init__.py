@@ -57,8 +57,6 @@ _cache_locks: dict[str, asyncio.Lock] = {}
 _global_lock = asyncio.Lock()
 CACHE_TTL = 300
 EMPTY_CACHE_TTL = 30
-# SQLite 绑定参数数量上限，从配置中获取（默认为 999）
-SQLITE_MAX_VARIABLE_NUMBER = config.sqlite_max_variable_number
 
 
 async def _get_group_lock(group_id: str) -> asyncio.Lock:
@@ -110,17 +108,7 @@ async def _get_cached_nickname_map(group_id: str) -> dict[str, str]:
             return cached[1]
 
         logger.debug(f"从数据库查询群组 {group_id} 的昵称映射")
-        try:
-            group_data = await fetch_group_nickname_map(group_id)
-        except sqlite3.Error:
-            logger.exception(f"查询群组 {group_id} 昵称映射时数据库出错，返回旧缓存或空映射")
-            # 优先返回已有缓存（即使已过期），避免在故障期间丢失已知映射
-            if cached:
-                return cached[1]
-            # 没有缓存时写入一个短 TTL 的空结果，避免在 DB 故障期间反复打爆数据库
-            # 使用新的时间戳计算过期时间
-            _nickname_cache[group_id] = (time() + EMPTY_CACHE_TTL, {})
-            return {}
+        group_data = await fetch_group_nickname_map(group_id)
 
         # 将 {user_id: [nicknames]} 转换为 {nickname: user_id}
         nickname_to_qq: dict[str, str] = {}
@@ -397,15 +385,6 @@ def parse_delete_command(text: str) -> list[str] | None:
     return [n.strip() for n in nickname_part.split() if n.strip()]
 
 
-def _build_in_clause_placeholders(count: int) -> str:
-    """构建 SQL IN 子句的参数占位符。
-
-    安全说明：此函数仅根据参数数量生成 "?,?,?" 形式的占位符字符串，
-    不涉及任何用户数据。实际值通过参数化查询传递，因此不存在 SQL 注入风险。
-    """
-    return ",".join("?" * count)
-
-
 def _dedupe_preserve_order(items: list[str]) -> list[str]:
     """去重并保持原有顺序"""
     seen: set[str] = set()
@@ -427,36 +406,24 @@ async def delete_nicknames_from_data(
     # 去重并保持原有顺序，避免冗余 SQL 和重复结果
     unique_nicknames = _dedupe_preserve_order(nicknames)
 
-    # 批量查询哪些昵称存在
-    # 为避免触及 SQLite 绑定参数上限（通常为 999），对 IN 列表进行分片查询
-    # 安全：placeholders 仅为 "?,?,?" 占位符，用户数据通过参数化查询传递
-    existing_set: set[str] = set()
-    # 每个查询除了昵称外还会绑定 group_id 和 user_id 两个参数
-    max_chunk_size = SQLITE_MAX_VARIABLE_NUMBER - 2
-
-    for i in range(0, len(unique_nicknames), max_chunk_size):
-        chunk = unique_nicknames[i : i + max_chunk_size]
-        placeholders = _build_in_clause_placeholders(len(chunk))
-        rows = await db.fetch_all(
-            f"SELECT nickname FROM nicknames "  # noqa: S608
-            f"WHERE group_id = ? AND user_id = ? AND nickname IN ({placeholders})",
-            (group_id, at_qq, *chunk),
-        )
-        existing_set.update(row["nickname"] for row in rows)
+    placeholders = ",".join("?" * len(unique_nicknames))
+    rows = await db.fetch_all(
+        f"SELECT nickname FROM nicknames "  # noqa: S608
+        f"WHERE group_id = ? AND user_id = ? AND nickname IN ({placeholders})",
+        (group_id, at_qq, *unique_nicknames),
+    )
+    existing_set = {row["nickname"] for row in rows}
 
     success = [n for n in unique_nicknames if n in existing_set]
     not_found = [n for n in unique_nicknames if n not in existing_set]
 
-    # 批量删除存在的昵称，同样进行分片
     if success:
-        for i in range(0, len(success), max_chunk_size):
-            chunk = success[i : i + max_chunk_size]
-            delete_placeholders = _build_in_clause_placeholders(len(chunk))
-            await db.execute(
-                f"DELETE FROM nicknames "  # noqa: S608
-                f"WHERE group_id = ? AND user_id = ? AND nickname IN ({delete_placeholders})",
-                (group_id, at_qq, *chunk),
-            )
+        delete_placeholders = ",".join("?" * len(success))
+        await db.execute(
+            f"DELETE FROM nicknames "  # noqa: S608
+            f"WHERE group_id = ? AND user_id = ? AND nickname IN ({delete_placeholders})",
+            (group_id, at_qq, *success),
+        )
         await _invalidate_cache(group_id)
 
     return success, not_found
