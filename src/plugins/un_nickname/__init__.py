@@ -49,22 +49,23 @@ db.ensure_schema(
 
 # 昵称映射缓存: {group_id: (expires_at, {nickname: user_id})}
 _nickname_cache: dict[str, tuple[float, dict[str, str]]] = {}
-# 分群锁，避免跨群阻塞；锁的生命周期绑定到对应群的缓存生命周期
+# 分群锁，避免跨群阻塞
+# 注意：锁一旦创建就不会被删除，因为清理锁会引入复杂的竞态条件问题。
+# 锁对象非常轻量，且实际使用中群组数量通常是有限的，内存开销可忽略不计。
 _cache_locks: dict[str, asyncio.Lock] = {}
 # 全局锁，用于保护 _cache_locks 字典的创建操作，避免竞态条件
 _global_lock = asyncio.Lock()
 CACHE_TTL = 300
 EMPTY_CACHE_TTL = 30
-# SQLite 绑定参数数量上限（默认为 999）
-SQLITE_MAX_VARIABLE_NUMBER = 999
+# SQLite 绑定参数数量上限，从配置中获取（默认为 999）
+SQLITE_MAX_VARIABLE_NUMBER = config.sqlite_max_variable_number
 
 
 async def _get_group_lock(group_id: str) -> asyncio.Lock:
     """获取指定群的缓存锁。
 
     使用全局锁保护锁的创建，避免竞态条件下为同一 group_id 创建多个锁实例。
-    锁的生命周期与 `_nickname_cache` 中对应群的缓存同步，在缓存失效时
-    会在 `_invalidate_cache` 中尝试清理该锁，从而避免 `_cache_locks` 无限增长。
+    锁一旦创建就会永久保留，不会被清理。
     """
     lock = _cache_locks.get(group_id)
     if lock is not None:
@@ -79,19 +80,6 @@ async def _get_group_lock(group_id: str) -> asyncio.Lock:
         return lock
 
 
-async def _try_remove_group_lock(group_id: str) -> None:
-    """在缓存被清理后尝试移除对应群的锁，避免 `_cache_locks` 无界增长。
-
-    使用全局锁保护，确保与 `_get_group_lock` 中的锁创建操作互斥。
-    仅在锁当前未被持有时删除；如果仍在被使用（有并发任务），则留到下一次
-    失效时再尝试清理。
-    """
-    async with _global_lock:
-        lock = _cache_locks.get(group_id)
-        if lock is not None and not lock.locked():
-            _cache_locks.pop(group_id, None)
-
-
 async def _invalidate_cache(group_id: str) -> None:
     """清除指定群组的昵称映射缓存
 
@@ -103,8 +91,6 @@ async def _invalidate_cache(group_id: str) -> None:
         if group_id in _nickname_cache:
             del _nickname_cache[group_id]
             logger.debug(f"已清除群组 {group_id} 的昵称缓存")
-    # 缓存已清理，尝试移除锁以避免内存泄漏
-    await _try_remove_group_lock(group_id)
 
 
 async def _get_cached_nickname_map(group_id: str) -> dict[str, str]:
