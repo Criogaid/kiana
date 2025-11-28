@@ -92,8 +92,13 @@ async def _try_remove_group_lock(group_id: str) -> None:
 
 async def _invalidate_cache(group_id: str) -> None:
     """清除指定群组的昵称映射缓存"""
+    # 快速路径：如果缓存不存在，无需获取锁
+    if group_id not in _nickname_cache:
+        return
+
     lock = await _get_group_lock(group_id)
     async with lock:
+        # 双重检查，因为在获取锁期间缓存可能已被其他协程清除
         if group_id in _nickname_cache:
             del _nickname_cache[group_id]
             logger.debug(f"已清除群组 {group_id} 的昵称缓存")
@@ -103,17 +108,17 @@ async def _invalidate_cache(group_id: str) -> None:
 
 async def _get_cached_nickname_map(group_id: str) -> dict[str, str]:
     """获取群组的昵称映射（带缓存）"""
-    now = time()
+    # 快速路径：无锁检查缓存是否有效
     cached = _nickname_cache.get(group_id)
-    if cached and now < cached[0]:
+    if cached and time() < cached[0]:
         logger.debug(f"使用群组 {group_id} 的昵称缓存")
         return cached[1]
 
     lock = await _get_group_lock(group_id)
     async with lock:
-        # 双重检查，避免重复回源
+        # 双重检查，避免重复回源；重新获取时间戳避免跨 await 的过期判断误差
         cached = _nickname_cache.get(group_id)
-        if cached and now < cached[0]:
+        if cached and time() < cached[0]:
             logger.debug(f"使用群组 {group_id} 的昵称缓存（锁内）")
             return cached[1]
 
@@ -126,7 +131,8 @@ async def _get_cached_nickname_map(group_id: str) -> dict[str, str]:
             if cached:
                 return cached[1]
             # 没有缓存时写入一个短 TTL 的空结果，避免在 DB 故障期间反复打爆数据库
-            _nickname_cache[group_id] = (now + EMPTY_CACHE_TTL, {})
+            # 使用新的时间戳计算过期时间
+            _nickname_cache[group_id] = (time() + EMPTY_CACHE_TTL, {})
             return {}
 
         # 将 {user_id: [nicknames]} 转换为 {nickname: user_id}
@@ -136,7 +142,8 @@ async def _get_cached_nickname_map(group_id: str) -> dict[str, str]:
                 nickname_to_qq[nickname] = user_id
 
         ttl = CACHE_TTL if nickname_to_qq else EMPTY_CACHE_TTL
-        _nickname_cache[group_id] = (now + ttl, nickname_to_qq)
+        # DB 查询后使用新的时间戳计算过期时间，确保 TTL 准确
+        _nickname_cache[group_id] = (time() + ttl, nickname_to_qq)
         logger.debug(f"已缓存群组 {group_id} 的 {len(nickname_to_qq)} 个昵称映射，TTL={ttl}s")
 
         return nickname_to_qq
