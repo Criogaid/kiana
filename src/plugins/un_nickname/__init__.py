@@ -49,27 +49,54 @@ db.ensure_schema(
 
 # 昵称映射缓存: {group_id: (expires_at, {nickname: user_id})}
 _nickname_cache: dict[str, tuple[float, dict[str, str]]] = {}
-# 分群锁，避免跨群阻塞
+# 分群锁，避免跨群阻塞；锁的生命周期绑定到对应群的缓存生命周期
 _cache_locks: dict[str, asyncio.Lock] = {}
+# 全局锁，用于保护 _cache_locks 字典的创建操作，避免竞态条件
+_global_lock = asyncio.Lock()
 CACHE_TTL = 300
 EMPTY_CACHE_TTL = 30
 
 
-def _get_group_lock(group_id: str) -> asyncio.Lock:
+async def _get_group_lock(group_id: str) -> asyncio.Lock:
+    """获取指定群的缓存锁。
+
+    使用全局锁保护锁的创建，避免竞态条件下为同一 group_id 创建多个锁实例。
+    锁的生命周期与 `_nickname_cache` 中对应群的缓存同步，在缓存失效时
+    会在 `_invalidate_cache` 中尝试清理该锁，从而避免 `_cache_locks` 无限增长。
+    """
     lock = _cache_locks.get(group_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        _cache_locks[group_id] = lock
-    return lock
+    if lock is not None:
+        return lock
+
+    async with _global_lock:
+        # 双重检查，避免重复创建
+        lock = _cache_locks.get(group_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _cache_locks[group_id] = lock
+        return lock
+
+
+def _try_remove_group_lock(group_id: str) -> None:
+    """在缓存被清理后尝试移除对应群的锁，避免 `_cache_locks` 无界增长。
+
+    仅在锁当前未被持有时删除；如果仍在被使用（有并发任务），则留到下一次
+    失效时再尝试清理。
+    """
+    lock = _cache_locks.get(group_id)
+    if lock is not None and not lock.locked():
+        _cache_locks.pop(group_id, None)
 
 
 async def _invalidate_cache(group_id: str) -> None:
     """清除指定群组的昵称映射缓存"""
-    lock = _get_group_lock(group_id)
+    lock = await _get_group_lock(group_id)
     async with lock:
         if group_id in _nickname_cache:
             del _nickname_cache[group_id]
             logger.debug(f"已清除群组 {group_id} 的昵称缓存")
+    # 缓存已清理，尝试移除锁以避免内存泄漏
+    _try_remove_group_lock(group_id)
 
 
 async def _get_cached_nickname_map(group_id: str) -> dict[str, str]:
@@ -80,7 +107,7 @@ async def _get_cached_nickname_map(group_id: str) -> dict[str, str]:
         logger.debug(f"使用群组 {group_id} 的昵称缓存")
         return cached[1]
 
-    lock = _get_group_lock(group_id)
+    lock = await _get_group_lock(group_id)
     async with lock:
         # 双重检查，避免重复回源
         cached = _nickname_cache.get(group_id)
@@ -93,8 +120,11 @@ async def _get_cached_nickname_map(group_id: str) -> dict[str, str]:
             group_data = await fetch_group_nickname_map(group_id)
         except Exception:
             logger.exception(f"查询群组 {group_id} 昵称映射时出错，返回旧缓存或空映射")
+            # 优先返回已有缓存（即使已过期），避免在故障期间丢失已知映射
             if cached:
                 return cached[1]
+            # 没有缓存时写入一个短 TTL 的空结果，避免在 DB 故障期间反复打爆数据库
+            _nickname_cache[group_id] = (now + EMPTY_CACHE_TTL, {})
             return {}
 
         # 将 {user_id: [nicknames]} 转换为 {nickname: user_id}
@@ -105,9 +135,7 @@ async def _get_cached_nickname_map(group_id: str) -> dict[str, str]:
 
         ttl = CACHE_TTL if nickname_to_qq else EMPTY_CACHE_TTL
         _nickname_cache[group_id] = (now + ttl, nickname_to_qq)
-        logger.debug(
-            f"已缓存群组 {group_id} 的 {len(nickname_to_qq)} 个昵称映射，TTL={ttl}s"
-        )
+        logger.debug(f"已缓存群组 {group_id} 的 {len(nickname_to_qq)} 个昵称映射，TTL={ttl}s")
 
         return nickname_to_qq
 
@@ -138,10 +166,7 @@ def is_valid_nickname(nickname: str) -> bool:
 
 def extract_at_qq_from_message(msg: Message) -> str | None:
     """从消息中提取第一个 @目标的 QQ 号"""
-    for seg in msg:
-        if seg.type == "at":
-            return seg.data.get("qq")
-    return None
+    return next((seg.data.get("qq") for seg in msg if seg.type == "at"), None)
 
 
 def extract_at_qq_and_nickname(msg: Message) -> tuple[str | None, str | None]:
@@ -376,6 +401,15 @@ def parse_delete_command(text: str) -> list[str] | None:
     return [n.strip() for n in nickname_part.split() if n.strip()]
 
 
+def _build_in_clause_placeholders(count: int) -> str:
+    """构建 SQL IN 子句的参数占位符。
+
+    安全说明：此函数仅根据参数数量生成 "?,?,?" 形式的占位符字符串，
+    不涉及任何用户数据。实际值通过参数化查询传递，因此不存在 SQL 注入风险。
+    """
+    return ",".join("?" * count)
+
+
 async def delete_nicknames_from_data(
     group_id: str, at_qq: str, nicknames: list[str]
 ) -> tuple[list[str], list[str]]:
@@ -383,13 +417,12 @@ async def delete_nicknames_from_data(
     if not nicknames:
         return [], []
 
-    # 批量查询哪些昵称存在（placeholders 只是 ? 字符，参数化查询安全）
-    placeholders = ",".join("?" * len(nicknames))
+    # 批量查询哪些昵称存在
+    # 安全：placeholders 仅为 "?,?,?" 占位符，用户数据通过参数化查询传递
+    placeholders = _build_in_clause_placeholders(len(nicknames))
     existing_rows = await db.fetch_all(
-        f"""
-        SELECT nickname FROM nicknames
-        WHERE group_id = ? AND user_id = ? AND nickname IN ({placeholders})
-        """,  # noqa: S608
+        f"SELECT nickname FROM nicknames "  # noqa: S608
+        f"WHERE group_id = ? AND user_id = ? AND nickname IN ({placeholders})",
         (group_id, at_qq, *nicknames),
     )
     existing_set = {row["nickname"] for row in existing_rows}
@@ -399,12 +432,10 @@ async def delete_nicknames_from_data(
 
     # 批量删除存在的昵称
     if success:
-        delete_placeholders = ",".join("?" * len(success))
+        delete_placeholders = _build_in_clause_placeholders(len(success))
         await db.execute(
-            f"""
-            DELETE FROM nicknames
-            WHERE group_id = ? AND user_id = ? AND nickname IN ({delete_placeholders})
-            """,  # noqa: S608
+            f"DELETE FROM nicknames "  # noqa: S608
+            f"WHERE group_id = ? AND user_id = ? AND nickname IN ({delete_placeholders})",
             (group_id, at_qq, *success),
         )
         await _invalidate_cache(group_id)
