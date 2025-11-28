@@ -47,15 +47,26 @@ db.ensure_schema(
     ]
 )
 
-# 昵称映射缓存: {group_id: (timestamp, {nickname: user_id})}
+# 昵称映射缓存: {group_id: (expires_at, {nickname: user_id})}
 _nickname_cache: dict[str, tuple[float, dict[str, str]]] = {}
-_cache_lock = asyncio.Lock()
+# 分群锁，避免跨群阻塞
+_cache_locks: dict[str, asyncio.Lock] = {}
 CACHE_TTL = 300
+EMPTY_CACHE_TTL = 30
+
+
+def _get_group_lock(group_id: str) -> asyncio.Lock:
+    lock = _cache_locks.get(group_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _cache_locks[group_id] = lock
+    return lock
 
 
 async def _invalidate_cache(group_id: str) -> None:
     """清除指定群组的昵称映射缓存"""
-    async with _cache_lock:
+    lock = _get_group_lock(group_id)
+    async with lock:
         if group_id in _nickname_cache:
             del _nickname_cache[group_id]
             logger.debug(f"已清除群组 {group_id} 的昵称缓存")
@@ -63,19 +74,28 @@ async def _invalidate_cache(group_id: str) -> None:
 
 async def _get_cached_nickname_map(group_id: str) -> dict[str, str]:
     """获取群组的昵称映射（带缓存）"""
-    async with _cache_lock:
-        now = time()
+    now = time()
+    cached = _nickname_cache.get(group_id)
+    if cached and now < cached[0]:
+        logger.debug(f"使用群组 {group_id} 的昵称缓存")
+        return cached[1]
 
-        # 检查缓存是否存在且未过期
-        if group_id in _nickname_cache:
-            cached_time, cached_data = _nickname_cache[group_id]
-            if now - cached_time < CACHE_TTL:
-                logger.debug(f"使用群组 {group_id} 的昵称缓存")
-                return cached_data
+    lock = _get_group_lock(group_id)
+    async with lock:
+        # 双重检查，避免重复回源
+        cached = _nickname_cache.get(group_id)
+        if cached and now < cached[0]:
+            logger.debug(f"使用群组 {group_id} 的昵称缓存（锁内）")
+            return cached[1]
 
-        # 从数据库查询
         logger.debug(f"从数据库查询群组 {group_id} 的昵称映射")
-        group_data = await fetch_group_nickname_map(group_id)
+        try:
+            group_data = await fetch_group_nickname_map(group_id)
+        except Exception:
+            logger.exception(f"查询群组 {group_id} 昵称映射时出错，返回旧缓存或空映射")
+            if cached:
+                return cached[1]
+            return {}
 
         # 将 {user_id: [nicknames]} 转换为 {nickname: user_id}
         nickname_to_qq: dict[str, str] = {}
@@ -83,8 +103,11 @@ async def _get_cached_nickname_map(group_id: str) -> dict[str, str]:
             for nickname in nicknames:
                 nickname_to_qq[nickname] = user_id
 
-        _nickname_cache[group_id] = (now, nickname_to_qq)
-        logger.debug(f"已缓存群组 {group_id} 的 {len(nickname_to_qq)} 个昵称映射")
+        ttl = CACHE_TTL if nickname_to_qq else EMPTY_CACHE_TTL
+        _nickname_cache[group_id] = (now + ttl, nickname_to_qq)
+        logger.debug(
+            f"已缓存群组 {group_id} 的 {len(nickname_to_qq)} 个昵称映射，TTL={ttl}s"
+        )
 
         return nickname_to_qq
 
@@ -113,12 +136,16 @@ def is_valid_nickname(nickname: str) -> bool:
     return bool(VALID_NICKNAME_PATTERN.match(nickname))
 
 
-def extract_at_qq_and_nickname(msg: Message) -> tuple[str | None, str | None]:
-    at_qq = None
+def extract_at_qq_from_message(msg: Message) -> str | None:
+    """从消息中提取第一个 @目标的 QQ 号"""
     for seg in msg:
         if seg.type == "at":
-            at_qq = seg.data.get("qq")
-            break
+            return seg.data.get("qq")
+    return None
+
+
+def extract_at_qq_and_nickname(msg: Message) -> tuple[str | None, str | None]:
+    at_qq = extract_at_qq_from_message(msg)
 
     if not at_qq:
         return None, None
@@ -335,13 +362,6 @@ clear_nickname_matcher = on_message(
 )
 
 
-def extract_at_qq_from_message(msg: Message) -> str | None:
-    for seg in msg:
-        if seg.type == "at":
-            return seg.data.get("qq")
-    return None
-
-
 def parse_delete_command(text: str) -> list[str] | None:
     command_match = re.match(r"^(删除昵称|移除昵称)\s+(.+)$", text)
     if not command_match:
@@ -359,14 +379,35 @@ def parse_delete_command(text: str) -> list[str] | None:
 async def delete_nicknames_from_data(
     group_id: str, at_qq: str, nicknames: list[str]
 ) -> tuple[list[str], list[str]]:
-    success: list[str] = []
-    not_found: list[str] = []
+    """批量删除昵称，返回 (成功列表, 不存在列表)"""
+    if not nicknames:
+        return [], []
 
-    for nickname in nicknames:
-        if await delete_single_nickname(group_id, at_qq, nickname):
-            success.append(nickname)
-        else:
-            not_found.append(nickname)
+    # 批量查询哪些昵称存在（placeholders 只是 ? 字符，参数化查询安全）
+    placeholders = ",".join("?" * len(nicknames))
+    existing_rows = await db.fetch_all(
+        f"""
+        SELECT nickname FROM nicknames
+        WHERE group_id = ? AND user_id = ? AND nickname IN ({placeholders})
+        """,  # noqa: S608
+        (group_id, at_qq, *nicknames),
+    )
+    existing_set = {row["nickname"] for row in existing_rows}
+
+    success = [n for n in nicknames if n in existing_set]
+    not_found = [n for n in nicknames if n not in existing_set]
+
+    # 批量删除存在的昵称
+    if success:
+        delete_placeholders = ",".join("?" * len(success))
+        await db.execute(
+            f"""
+            DELETE FROM nicknames
+            WHERE group_id = ? AND user_id = ? AND nickname IN ({delete_placeholders})
+            """,  # noqa: S608
+            (group_id, at_qq, *success),
+        )
+        await _invalidate_cache(group_id)
 
     return success, not_found
 
@@ -411,13 +452,7 @@ async def handle_delete_nickname(bot: Bot, event: GroupMessageEvent) -> None:
 
 @clear_nickname_matcher.handle()
 async def handle_clear_nickname(bot: Bot, event: GroupMessageEvent) -> None:
-    msg = event.message
-    at_qq = None
-
-    for seg in msg:
-        if seg.type == "at":
-            at_qq = seg.data.get("qq")
-            break
+    at_qq = extract_at_qq_from_message(event.message)
 
     if not at_qq:
         await clear_nickname_matcher.finish("请@要清空昵称的用户")
