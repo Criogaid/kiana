@@ -77,15 +77,17 @@ async def _get_group_lock(group_id: str) -> asyncio.Lock:
         return lock
 
 
-def _try_remove_group_lock(group_id: str) -> None:
+async def _try_remove_group_lock(group_id: str) -> None:
     """在缓存被清理后尝试移除对应群的锁，避免 `_cache_locks` 无界增长。
 
+    使用全局锁保护，确保与 `_get_group_lock` 中的锁创建操作互斥。
     仅在锁当前未被持有时删除；如果仍在被使用（有并发任务），则留到下一次
     失效时再尝试清理。
     """
-    lock = _cache_locks.get(group_id)
-    if lock is not None and not lock.locked():
-        _cache_locks.pop(group_id, None)
+    async with _global_lock:
+        lock = _cache_locks.get(group_id)
+        if lock is not None and not lock.locked():
+            _cache_locks.pop(group_id, None)
 
 
 async def _invalidate_cache(group_id: str) -> None:
@@ -96,7 +98,7 @@ async def _invalidate_cache(group_id: str) -> None:
             del _nickname_cache[group_id]
             logger.debug(f"已清除群组 {group_id} 的昵称缓存")
     # 缓存已清理，尝试移除锁以避免内存泄漏
-    _try_remove_group_lock(group_id)
+    await _try_remove_group_lock(group_id)
 
 
 async def _get_cached_nickname_map(group_id: str) -> dict[str, str]:
@@ -118,8 +120,8 @@ async def _get_cached_nickname_map(group_id: str) -> dict[str, str]:
         logger.debug(f"从数据库查询群组 {group_id} 的昵称映射")
         try:
             group_data = await fetch_group_nickname_map(group_id)
-        except Exception:
-            logger.exception(f"查询群组 {group_id} 昵称映射时出错，返回旧缓存或空映射")
+        except sqlite3.Error:
+            logger.exception(f"查询群组 {group_id} 昵称映射时数据库出错，返回旧缓存或空映射")
             # 优先返回已有缓存（即使已过期），避免在故障期间丢失已知映射
             if cached:
                 return cached[1]
@@ -410,6 +412,17 @@ def _build_in_clause_placeholders(count: int) -> str:
     return ",".join("?" * count)
 
 
+def _dedupe_preserve_order(items: list[str]) -> list[str]:
+    """去重并保持原有顺序"""
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+
+
 async def delete_nicknames_from_data(
     group_id: str, at_qq: str, nicknames: list[str]
 ) -> tuple[list[str], list[str]]:
@@ -417,18 +430,21 @@ async def delete_nicknames_from_data(
     if not nicknames:
         return [], []
 
+    # 去重并保持原有顺序，避免冗余 SQL 和重复结果
+    unique_nicknames = _dedupe_preserve_order(nicknames)
+
     # 批量查询哪些昵称存在
     # 安全：placeholders 仅为 "?,?,?" 占位符，用户数据通过参数化查询传递
-    placeholders = _build_in_clause_placeholders(len(nicknames))
+    placeholders = _build_in_clause_placeholders(len(unique_nicknames))
     existing_rows = await db.fetch_all(
         f"SELECT nickname FROM nicknames "  # noqa: S608
         f"WHERE group_id = ? AND user_id = ? AND nickname IN ({placeholders})",
-        (group_id, at_qq, *nicknames),
+        (group_id, at_qq, *unique_nicknames),
     )
     existing_set = {row["nickname"] for row in existing_rows}
 
-    success = [n for n in nicknames if n in existing_set]
-    not_found = [n for n in nicknames if n not in existing_set]
+    success = [n for n in unique_nicknames if n in existing_set]
+    not_found = [n for n in unique_nicknames if n not in existing_set]
 
     # 批量删除存在的昵称
     if success:
