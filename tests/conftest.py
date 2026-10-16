@@ -168,7 +168,7 @@ async def reset_word_pulse_tables() -> None:
 @pytest.fixture(autouse=True)
 def reset_word_pulse_runtime(monkeypatch):
     import asyncio
-    from src.plugins.word_pulse import classifiers, pipeline, report
+    from src.plugins.word_pulse import candidates, classifiers, pipeline, report
     from src.plugins.word_pulse.config import Config
 
     classifiers._matchers.clear()
@@ -176,6 +176,7 @@ def reset_word_pulse_runtime(monkeypatch):
     monkeypatch.setattr(pipeline, "_tick_lock", asyncio.Lock())
     report.result_cache.clear()
     report._query_locks.clear()
+    candidates._scan_locks.clear()
     monkeypatch.setattr(pipeline, "config", Config())
     monkeypatch.setattr(report, "config", Config())
 
