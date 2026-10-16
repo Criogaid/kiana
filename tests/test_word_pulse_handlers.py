@@ -135,3 +135,31 @@ async def test_quoted_command_routes_through_matcher(app, monkeypatch):
         ctx.receive_event(bot, event)
         ctx.should_pass_rule()
         ctx.should_call_send(event, "本群暂无主题", result={"message_id": 101})
+
+
+@pytest.mark.parametrize("prefix", ["", "/"])
+@pytest.mark.parametrize("text,role,permission_denied", [
+    ("词频添加 炒股", "member", True),
+    ("词频添加 炒股", "admin", False),
+    ("词频添加 炒股", "owner", False),
+    ("词频 炒股 错误时间", "member", False),
+])
+async def test_invalid_command_checks_permission_before_format(app, monkeypatch, prefix, text, role, permission_denied):
+    from src.plugins import word_pulse
+    from src.plugins.word_pulse import handlers
+    from src.plugins.word_pulse.commands import InvalidCommand, parse
+    monkeypatch.setattr(word_pulse.config, "word_pulse_plugin_enabled", True)
+    dispatch = AsyncMock(side_effect=AssertionError("invalid commands must not dispatch"))
+    monkeypatch.setattr(handlers, "dispatch", dispatch)
+    event = _make_group_event(prefix + text, role=role)
+    request = parse(prefix + text)
+    assert isinstance(request, InvalidCommand)
+    expected = "仅群主、群管理员或 Bot 管理员可用" if permission_denied else request.message
+    async with app.test_matcher(word_pulse.matcher) as ctx:
+        bot = ctx.create_bot(base=Bot, self_id="987654321")
+        ctx.should_call_api("get_group_member_info", {"group_id": 200001, "user_id": 987654321, "no_cache": True}, result={"shut_up_timestamp": 0})
+        ctx.receive_event(bot, event)
+        ctx.should_pass_rule()
+        ctx.should_call_send(event, expected, result={"message_id": 100})
+    dispatch.assert_not_awaited()
+    assert await word_pulse.db.get_theme("200001", "炒股") is None

@@ -31,20 +31,32 @@ async def test_rule_edit_during_live_classification_is_reconciled(app, monkeypat
     from tests.test_word_pulse_analysis_extra import archive, setup_theme
     theme = await setup_theme("semantic")
     await pipeline.ensure_cursor("g", 100)
-    last = await archive("亏麻了", 110)
+    await pipeline.reconcile(theme, 100)
+    last = await archive("割肉，亏麻了", 110)
     async def classify(messages, themes):
         await db.add_aliases(theme.id, "割肉", ["亏麻了"])
         return await pipeline.AIClassifier.literal_only(messages, themes)
-    monkeypatch.setattr(pipeline.AIClassifier, "classify", AsyncMock(side_effect=classify))
+    classifier = AsyncMock(side_effect=classify)
+    monkeypatch.setattr(pipeline.AIClassifier, "classify", classifier)
     await pipeline.run_live("g", 120)
     current = await db.get_theme("g", "炒股")
+    classifier.assert_awaited_once()
+    assert current.rules_version > theme.rules_version
     assert (await db.get_cursor("g"))[0] == last
+    assert await db.aggregate_relevant(theme.id, theme.rules_version, 0, 200) == (1, 1)
+    assert await db.sum_unclassified(theme.id, theme.rules_version, "1970-01-01", "1970-01-01") == 1
     assert await db.aggregate_relevant(theme.id, current.rules_version, 0, 200) == (0, 0)
     await pipeline.reconcile(current, 130)
-    current = await db.get_theme("g", "炒股")
+    assert await db.aggregate_relevant(theme.id, theme.rules_version, 0, 200) == (0, 0)
+    assert await db.sum_unclassified(theme.id, theme.rules_version, "1970-01-01", "1970-01-01") == 0
     pipeline.config.word_pulse_ai_daily_budget = 0
-    await pipeline.run_backfill(current, 130)
+    pipeline.config.word_pulse_plugin_enabled = True
+    await pipeline.tick(130)
+    await pipeline.tick(140)
     assert await db.aggregate_relevant(theme.id, current.rules_version, 0, 200) == (1, 1)
+    assert await db.sum_unclassified(theme.id, current.rules_version, "1970-01-01", "1970-01-01") == 1
+    assert (await db.db.fetch_one("SELECT COUNT(*) FROM word_pulse_label WHERE theme_id=?", (theme.id,)))[0] == 1
+    assert (await db.db.fetch_one("SELECT SUM(count) FROM word_pulse_unclassified WHERE theme_id=?", (theme.id,)))[0] == 1
 
 
 @pytest.mark.parametrize("mode,whitelist,blacklist,allowed", [
@@ -111,3 +123,33 @@ def test_scheduler_and_config_bounds(app):
                          ("word_pulse_ai_output_mode", "invalid")]:
         with pytest.raises(ValidationError):
             Config(**{field: value})
+
+
+async def test_rule_edit_after_reconcile_skips_live_and_backfills_once(app, monkeypatch):
+    from src.plugins.word_pulse import db, pipeline
+    from tests.test_word_pulse_analysis_extra import archive, setup_theme
+
+    theme = await setup_theme("semantic")
+    await pipeline.ensure_cursor("g", 100)
+    await pipeline.reconcile(theme, 100)
+    await db.add_aliases(theme.id, "割肉", ["亏麻了"])
+    last = await archive("亏麻了", 110)
+    classifier = AsyncMock(side_effect=AssertionError("unreconciled theme must not reach AI"))
+    monkeypatch.setattr(pipeline.AIClassifier, "classify", classifier)
+    pipeline.config.word_pulse_ai_daily_budget = 0
+    await pipeline.run_live("g", 120)
+
+    assert await db.get_cursor("g") == (last, 120)
+    assert (await db.db.fetch_one("SELECT COUNT(*) FROM word_pulse_label WHERE theme_id=?", (theme.id,)))[0] == 0
+    assert (await db.db.fetch_one("SELECT COUNT(*) FROM word_pulse_unclassified WHERE theme_id=?", (theme.id,)))[0] == 0
+    pipeline.config.word_pulse_plugin_enabled = True
+    await pipeline.tick(130)
+    current = await db.get_theme("g", "炒股")
+    assert current.backfill_version == current.rules_version
+    assert current.backfill_until_id == last and current.backfill_next_id is None
+    assert await db.aggregate_relevant(theme.id, current.rules_version, 0, 200) == (1, 1)
+    assert await db.sum_unclassified(theme.id, current.rules_version, "1970-01-01", "1970-01-01") == 1
+    await pipeline.tick(140)
+    assert await db.aggregate_relevant(theme.id, current.rules_version, 0, 200) == (1, 1)
+    assert await db.sum_unclassified(theme.id, current.rules_version, "1970-01-01", "1970-01-01") == 1
+    classifier.assert_not_awaited()
