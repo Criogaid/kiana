@@ -7,7 +7,7 @@ from datetime import datetime
 
 from nonebot import get_plugin_config, logger, require
 
-from . import db
+from . import db, render
 from .classifiers import AI_ERRORS, SUMMARY_CALLER, ai_available
 from .commands import USAGE
 from .config import (
@@ -32,6 +32,7 @@ config = get_plugin_config(Config)
 class ReportResult:
     text: str
     data: ReportData | None
+    chart: bytes | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,7 +127,7 @@ async def build_report(group_id: str, theme_name: str, window_days: int, now: in
             return ReportResult(await _missing(group_id, theme_name), None)
         theme, semantic = data.theme, data.semantic_enabled
         key = (theme.id, theme.rules_version, window_days, data.data_as_of)
-        result = ReportResult(await _render_report(data, now), data)
+        result = ReportResult(await _render_report(data, now), data, await _chart(data))
         result_cache[key] = CachedReport(now, theme, semantic, result)
         return result
 
@@ -211,3 +212,11 @@ async def _render_report(data: ReportData, now: int) -> str:
         if trend:
             text += f"\n📈 {trend}"
     return text
+
+
+async def _chart(data: ReportData) -> bytes | None:
+    try:
+        return await asyncio.to_thread(render.render_trend_chart, data)
+    except Exception:
+        logger.exception("Word Pulse chart failed; returning text only")
+        return None
