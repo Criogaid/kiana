@@ -6,7 +6,7 @@ from nonebot import get_driver, logger
 from nonebot.adapters.onebot.v11 import GroupMessageEvent, MessageEvent
 from nonebot.matcher import Matcher
 
-from . import db, report
+from . import candidates, db, report
 from .commands import ADMIN_ACTIONS, Command, InvalidCommand, parse
 from .core.types import ThemeMode
 
@@ -78,6 +78,8 @@ async def _manage(group_id: str, command: Command) -> str:
     if theme is None:
         return f"本群没有主题「{command.theme}」。\n" + await report.build_list(group_id)
     match command.action:
+        case "candidates":
+            return await candidates.scan_candidates(theme, int(time.time()))
         case "delete":
             await db.delete_theme(theme.id)
             return f"已删除主题「{theme.name}」"

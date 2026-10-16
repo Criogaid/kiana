@@ -557,3 +557,20 @@ async def recent_example_ids(
         if row:
             result[cluster_id] = row[0]
     return result
+
+
+async def candidate_archive_ids(
+    theme_id: int, rules_version: int, start: int, end: int
+) -> list[int]:
+    """Select current-version AI evidence without any literal evidence for the same theme/message."""
+    rows = await db.fetch_all(
+        """SELECT DISTINCT ai.archive_id FROM word_pulse_label AS ai
+        WHERE ai.theme_id=? AND ai.rules_version=? AND ai.event_time>=? AND ai.event_time<?
+        AND ai.source='ai' AND NOT EXISTS (
+            SELECT 1 FROM word_pulse_label AS literal
+            WHERE literal.theme_id=ai.theme_id AND literal.archive_id=ai.archive_id
+            AND literal.rules_version=ai.rules_version AND literal.source='literal')
+        ORDER BY ai.archive_id""",
+        (theme_id, rules_version, start, end),
+    )
+    return [row[0] for row in rows]
