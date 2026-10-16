@@ -88,7 +88,13 @@ async def run_live(group_id: str, now: int) -> None:
     if not raw:
         await db.touch_cursor(group_id, now)
         return
-    themes = await db.list_themes(group_id)
+    # A theme changed after reconcile will backfill up to the advanced cursor next tick;
+    # classifying it here would write current-version rows twice.
+    themes = [
+        theme
+        for theme in await db.list_themes(group_id)
+        if theme.backfill_version == theme.rules_version
+    ]
     msgs = [
         Msg(row.id, row.event_time, row.user_id, row.plain_text)
         for row in raw

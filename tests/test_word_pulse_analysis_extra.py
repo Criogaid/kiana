@@ -50,6 +50,7 @@ async def test_third_ai_failure_falls_back_without_stalling_cursor(app, monkeypa
     from src.plugins.word_pulse.errors import WordPulseAITimeoutError
     theme = await setup_theme("semantic")
     await pipeline.ensure_cursor("g", 10)
+    await pipeline.reconcile(theme, 10)
     last_id = await archive("割肉", 20)
     fail = AsyncMock(side_effect=WordPulseAITimeoutError("timeout"))
     monkeypatch.setattr(pipeline.AIClassifier, "classify", fail)
@@ -70,6 +71,7 @@ async def test_budget_caps_ai_head_and_records_unclassified_tail(app, monkeypatc
     theme = await setup_theme("semantic")
     pipeline.config.word_pulse_ai_daily_budget = 1
     await pipeline.ensure_cursor("g", 10)
+    await pipeline.reconcile(theme, 10)
     await archive("未知说法", 20)
     await archive("割肉", 21)
     classify = AsyncMock(return_value=ClassifyOutcome((), {}))
@@ -96,6 +98,7 @@ async def test_noise_is_skipped_but_cursor_advances(app):
     from src.plugins.word_pulse import db, pipeline
     theme = await setup_theme("semantic")
     await pipeline.ensure_cursor("g", 10)
+    await pipeline.reconcile(theme, 10)
     await archive("词频 炒股", 20)
     await archive("！！！", 21)
     end = await archive("割肉", 22, user="bot")

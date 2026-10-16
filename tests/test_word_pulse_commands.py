@@ -41,3 +41,27 @@ def test_non_commands_are_ignored(app, text):
 def test_invalid_known_commands_report_format_or_limit(app, text):
     from src.plugins.word_pulse.commands import InvalidCommand, parse
     assert isinstance(parse(text), InvalidCommand)
+
+
+@pytest.mark.parametrize("prefix", ["", "/"])
+@pytest.mark.parametrize("word,action", [
+    ("词频添加", "add"), ("词频移除", "remove"), ("词频删除", "delete"),
+    ("词频别名添加", "alias_add"), ("词频别名删除", "alias_remove"),
+    ("词频别名移除", "alias_remove"), ("词频说明", "description"),
+    ("词频模式", "mode"), ("词频候选", "candidates"),
+    ("词频列表", "list"), ("词频详情", "detail"),
+])
+def test_action_of_uses_command_word_regardless_of_arguments(app, prefix, word, action):
+    from src.plugins.word_pulse.commands import action_of
+    assert action_of(prefix + word) == action
+    assert action_of(f"  {prefix}{word} 任意 参数 不影响 动作识别  ") == action
+
+
+@pytest.mark.parametrize("text", [
+    "", "  ", "/", "词频", "/词频", "词频 炒股", "/词频 炒股 7天",
+    "词频 炒股 错误时间", "普通聊天", "词频很高", "词频添加了",
+    "/词频添加了 炒股", "请用 词频添加 炒股",
+])
+def test_action_of_ignores_queries_and_non_commands(app, text):
+    from src.plugins.word_pulse.commands import action_of
+    assert action_of(text) is None

@@ -132,7 +132,7 @@ async def build_report(group_id: str, theme_name: str, window_days: int, now: in
         return result
 
 
-def render_text(data: ReportData) -> str:
+def render_text(data: ReportData, trend: str | None = None) -> str:
     as_of = (
         datetime.fromtimestamp(data.data_as_of, TZ).strftime("%H:%M")
         if data.data_as_of is not None
@@ -150,6 +150,8 @@ def render_text(data: ReportData) -> str:
             lines.append("（一条消息可属于多个子类，占比合计可能超过 100%）")
     else:
         lines.append(f"近{data.window_days}天暂无与「{data.theme.name}」相关的讨论")
+    if trend:
+        lines.append(f"📈 {trend}")
     if data.backfilling:
         lines.append("ℹ️ 规则刚更新，历史数据重算中，结果可能偏少")
     if data.theme.mode == "semantic" and not data.semantic_enabled:
@@ -204,13 +206,13 @@ async def _trend_sentence(data: ReportData) -> str | None:
 
 
 async def _render_report(data: ReportData, now: int) -> str:
-    text = render_text(data)
-    if config.word_pulse_show_examples:
-        text += await _examples(data, now)
+    trend = None
     if data.relevant_messages and _ai.resolve(SUMMARY_CALLER).complete:
         trend = await _trend_sentence(data)
-        if trend:
-            text += f"\n📈 {trend}"
+    # The trend follows the ranking it summarizes; data-quality notes come after it.
+    text = render_text(data, trend)
+    if config.word_pulse_show_examples:
+        text += await _examples(data, now)
     return text
 
 

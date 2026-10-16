@@ -7,28 +7,30 @@ from nonebot.adapters.onebot.v11 import GroupMessageEvent, Message, MessageEvent
 from nonebot.matcher import Matcher
 
 from . import candidates, db, report
-from .commands import ADMIN_ACTIONS, Command, InvalidCommand, parse
+from .commands import ADMIN_ACTIONS, Command, InvalidCommand, action_of, parse
 from .core.types import ThemeMode
 
 _CHANGED = "统计将在下次后台处理时按新规则重算"
 
 
 async def handle(event: MessageEvent, matcher: Matcher) -> None:
-    request = parse(event.get_plaintext())
+    plaintext = event.get_plaintext()
+    request = parse(plaintext)
     if request is None:
         return
     if not isinstance(event, GroupMessageEvent):
         await matcher.send("仅支持群聊使用")
         return
-    if isinstance(request, InvalidCommand):
-        await matcher.send(request.message)
-        return
     admin = str(event.user_id) in get_driver().config.superusers or event.sender.role in (
         "owner",
         "admin",
     )
-    if request.action in ADMIN_ACTIONS and not admin:
+    # Check permission before format hints so members never see management usage.
+    if action_of(plaintext) in ADMIN_ACTIONS and not admin:
         await matcher.send("仅群主、群管理员或 Bot 管理员可用")
+        return
+    if isinstance(request, InvalidCommand):
+        await matcher.send(request.message)
         return
     try:
         text = await dispatch(str(event.group_id), request)

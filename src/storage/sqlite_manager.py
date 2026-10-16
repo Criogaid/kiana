@@ -37,6 +37,11 @@ class SQLiteManager:
             for statement in statements:
                 self._conn.execute(statement)
 
+    def migrate(self, operation: Callable[[sqlite3.Connection], None]) -> None:
+        """Run a startup migration synchronously in one transaction, before concurrent access."""
+        with self._conn:
+            operation(self._conn)
+
     async def execute(self, sql: str, params: Sequence[Any] | None = None) -> None:
         await self._run(sql, params, fetch_kind=None)
 
