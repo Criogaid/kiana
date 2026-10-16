@@ -2,9 +2,9 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import timedelta
 
-from .timeutil import TZ, day_of, window_bounds
+from .timeutil import day_of, local_datetime, window_bounds
 from .types import OTHER, ThemeRule
 
 
@@ -71,7 +71,7 @@ def build(
         )
         if row.messages and row.cluster_id in names
     )
-    first_day = datetime.fromtimestamp(window_bounds(now, window_days)[0], TZ).date()
+    first_day = local_datetime(window_bounds(now, window_days)[0]).date()
     buckets: dict[str, dict[int, set[int]]] = {
         (first_day + timedelta(days=offset)).isoformat(): {cluster: set() for cluster in names}
         for offset in range(window_days)

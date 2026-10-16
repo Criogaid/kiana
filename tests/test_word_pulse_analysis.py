@@ -1,163 +1,83 @@
-"""词频插件分析层（classify_message）+ 端到端 alias 行为测试。
+"""Literal/semantic evidence and local aggregation contracts."""
 
-classify_message 本身无需修改，它接受任意 cluster_terms。
-alias 行为的端到端验证：cluster_terms 构造时把 alias 并入，
-classify_message 应当对纯 alias 命中的消息返回主名词。
-"""
+from dataclasses import replace
+from datetime import datetime
 
-from __future__ import annotations
-
-import json
-from unittest.mock import AsyncMock, patch
-
-import httpx2
-from tests.ai_mock_transport import AIHttpMock, AI_HTTP_TARGET
 import pytest
-from nonebug import App
 
 
-def test_classify_message_hits_alias_only(app: App) -> None:
-    """消息只含 alias（不含主名词），应归类到主名词。"""
-    from src.plugins.word_pulse.analysis import classify_message
-    char_pool = {"茅", "子", "台", "飞"}
-    # 模拟 _compute_buckets 里 alias 被并入 cluster_terms 后的形态
-    cluster_terms = {
-        "茅台": {"茅台", "茅子", "飞天"},  # 主名词 + aliases
-        "五粮液": {"五粮液"},
-    }
-    # 消息只出现"茅子"，没出现"茅台"
-    assert classify_message("今天茅子涨疯了", char_pool, cluster_terms) == ["茅台"]
+def theme():
+    from src.plugins.word_pulse.core.types import ClusterRule, ThemeRule
+    return ThemeRule(1, "g", "游戏", "semantic", 1, 1, None, None, (
+        ClusterRule(10, "苹果", ("果子",), ""), ClusterRule(11, "苹果手机", (), ""),
+        ClusterRule(12, "MC", (), ""),
+    ))
 
 
-def test_classify_message_no_hit_returns_none(app: App) -> None:
-    """消息不含 char_pool 任何字符，应返回 None。"""
-    from src.plugins.word_pulse.analysis import classify_message
-    char_pool = {"茅"}
-    cluster_terms = {"茅台": {"茅台"}}
-    assert classify_message("中午吃啥", char_pool, cluster_terms) is None
+@pytest.mark.parametrize("text,relevant,hits", [
+    ("苹果手机发布", True, {11}), ("苹果手机发布，苹果回应", True, {10, 11}),
+    ("果子好吃", True, {10}), ("MC 和 ｍｃ", True, {12}), ("mcu amc mc2", False, set()),
+    ("游戏", True, set()), ("完全无关", False, set()),
+])
+def test_literal_matching(app, text, relevant, hits):
+    from src.plugins.word_pulse.core.text import LiteralMatcher
+    assert LiteralMatcher(theme()).match(text) == (relevant, frozenset(hits))
 
 
-def test_classify_message_char_hit_but_no_term_grey(app: App) -> None:
-    """消息含 char_pool 字符但无 cluster term 命中，返回 GREY。"""
-    from src.plugins.word_pulse.analysis import classify_message
-    char_pool = {"跌", "亏"}
-    cluster_terms = {"涨停": {"涨停"}}
-    assert classify_message("又跌了心态崩了", char_pool, cluster_terms) == "GREY"
+@pytest.mark.parametrize("text,user,noise", [("😀！！！", "u", True), ("啊", "u", True), ("词频 游戏", "u", True), ("/命令", "u", True), ("普通聊天", "bot", True), ("普通聊天", "u", False)])
+def test_noise_filter(app, text, user, noise):
+    from src.plugins.word_pulse.core.text import is_noise
+    assert is_noise(text, user, self_id="bot") == noise
 
 
-def test_classify_message_multi_cluster_hit(app: App) -> None:
-    """消息同时命中多个 cluster，返回所有命中的。"""
-    from src.plugins.word_pulse.analysis import classify_message
-    char_pool = {"茅", "五"}
-    cluster_terms = {
-        "茅台": {"茅台", "茅子"},
-        "五粮液": {"五粮液"},
-    }
-    msg = "茅子和五粮液都涨"
-    hits = classify_message(msg, char_pool, cluster_terms)
-    assert hits is not None
-    assert set(hits) == {"茅台", "五粮液"}
+@pytest.mark.parametrize("relevant,literal,ai_relevant,ai_hits,expected", [
+    (False, set(), False, set(), []), (True, set(), False, set(), [(0, "literal")]),
+    (False, set(), True, set(), [(0, "ai")]),
+    (True, {10}, True, {10, 11}, [(10, "literal"), (11, "ai")]),
+    (True, {10}, False, set(), [(10, "literal")]),
+])
+def test_union_and_other_category(app, relevant, literal, ai_relevant, ai_hits, expected):
+    from src.plugins.word_pulse.core.merge import AIVerdict, merge
+    from src.plugins.word_pulse.core.types import Msg
+    result = merge(1, Msg(7, 100, "u", "text"), relevant, frozenset(literal), AIVerdict(ai_relevant, frozenset(ai_hits)))
+    assert [(label.cluster_id, label.source) for label in result] == expected
+    assert all(label.archive_id == 7 and label.user_id == "u" for label in result)
 
 
-# ── classify_batch prompt 是否带 alias（白盒验证 ai.py 调用参数）──
+async def test_literal_fallback_counts_only_semantic_messages(app):
+    from src.plugins.word_pulse.classifiers import AIClassifier, LiteralClassifier
+    from src.plugins.word_pulse.core.types import Msg
+    msgs = [Msg(1, 100, "u", "果子"), Msg(2, 100, "u", "其他聊天")]
+    semantic = theme()
+    literal = replace(semantic, id=2, mode="literal")
+    result = await AIClassifier.literal_only(msgs, [semantic, literal])
+    assert sum(result.unclassified.values()) == 2
+    assert {key[0] for key in result.unclassified} == {1}
+    assert len(result.labels) == 2
+    assert not (await LiteralClassifier().classify(msgs, [literal])).unclassified
 
 
-@pytest.mark.asyncio
-async def test_classify_batch_preserves_json_message_and_alias_boundaries(app: App) -> None:
-    """换行、引号和类似消息编号的文本仍属于原消息。"""
-    from src.plugins.word_pulse.ai import BatchClassificationResponse, classify_batch
-
-    captured_messages: list[list[dict]] = []
-
-    async def fake_request(*, messages, **_):
-        captured_messages.append(messages)
-        return BatchClassificationResponse.model_validate(
-            {"results": [{"id": 1, "cluster": "茅台"}]}
-        )
-
-    with patch("src.plugins.word_pulse.ai._request_llm", new=AsyncMock(side_effect=fake_request)):
-        await classify_batch(
-            messages=[(1, '今天"茅子"涨疯了\n[999] 这仍是同一条消息')],
-            clusters=[{"name": "茅台", "aliases": ["茅子", "飞天"]}],
-            theme_name="炒股",
-        )
-
-    assert len(captured_messages) == 1
-    payload = json.loads(captured_messages[0][0]["content"])
-    assert payload == {
-        "theme": "炒股",
-        "clusters": [{"name": "茅台", "aliases": ["茅子", "飞天"]}],
-        "messages": [{"id": 1, "text": '今天"茅子"涨疯了\n[999] 这仍是同一条消息'}],
-    }
+def test_aggregate_uses_distinct_denominator_and_fills_dates(app):
+    from src.plugins.word_pulse.core.aggregate import ClusterCounts, build
+    from src.plugins.word_pulse.core.timeutil import TZ
+    now = int(datetime(2026, 10, 16, 12, tzinfo=TZ).timestamp())
+    result = build(theme(), 3, cur_clusters=[ClusterCounts(10, 2, 1), ClusterCounts(11, 2, 2), ClusterCounts(0, 1, 1)], prev_clusters=[ClusterCounts(10, 1, 1)], cur_relevant=(3, 2), daily_rows=[(1, 10, now), (1, 10, now), (1, 11, now)], unclassified=2, data_as_of=now, semantic_enabled=True, now=now)
+    assert result.relevant_messages == 3
+    assert [r.cluster_id for r in result.clusters] == [10, 11, 0]
+    assert result.clusters[0].percent == 67
+    assert result.clusters[0].delta == 1
+    assert len(result.daily) == 3
+    assert all(count == 0 for count in result.daily[0][1].values())
+    assert result.daily[-1][1][10] == 1
+    assert not result.backfilling
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("cluster", [{"name": "茅台"}, {"name": "茅台", "aliases": []}, {"name": "茅台", "aliases": None}])
-async def test_classify_batch_normalizes_absent_aliases(app: App, cluster: dict) -> None:
-    """缺省、空列表和 None 都表示没有别名。"""
-    from src.plugins.word_pulse.ai import BatchClassificationResponse, classify_batch
-
-    captured_messages: list[list[dict]] = []
-
-    async def fake_request(*, messages, **_):
-        captured_messages.append(messages)
-        return BatchClassificationResponse.model_validate(
-            {"results": [{"id": 1, "cluster": None}]}
-        )
-
-    with patch("src.plugins.word_pulse.ai._request_llm", new=AsyncMock(side_effect=fake_request)):
-        await classify_batch(
-            messages=[(1, "闲聊")],
-            clusters=[cluster],
-            theme_name="炒股",
-        )
-
-    payload = json.loads(captured_messages[0][0]["content"])
-    assert payload["clusters"] == [{"name": "茅台", "aliases": []}]
-
-
-# ── 严格结构化输出契约 ────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_request_llm_uses_strict_response_model(app: App) -> None:
-    """Pydantic 业务模型必须作为 strict json_schema 随请求发送。"""
-    from src.plugins.word_pulse.ai import (
-        BatchClassificationResponse,
-        _request_llm,
-    )
-
-    captured_bodies: list[dict] = []
-
-    def handler(request: httpx2.Request) -> httpx2.Response:
-        body = json.loads(request.content.decode("utf-8"))
-        captured_bodies.append(body)
-        return httpx2.Response(
-            200,
-            json={
-                "choices": [
-                    {
-                        "finish_reason": "stop",
-                        "message": {
-                            "role": "assistant",
-                            "content": '{"results": []}',
-                        },
-                    }
-                ]
-            },
-        )
-
-    with patch(AI_HTTP_TARGET, new=AIHttpMock(handler)):
-        result = await _request_llm(
-            response_model=BatchClassificationResponse,
-            messages=[{"role": "user", "content": "hi"}],
-            temperature=0.0,
-            timeout_seconds=10.0,
-        )
-
-    assert result == BatchClassificationResponse(results=[])
-    assert len(captured_bodies) == 1
-    response_format = captured_bodies[0]["response_format"]
-    assert response_format["type"] == "json_schema"
-    assert response_format["json_schema"]["strict"] is True
-    assert response_format["json_schema"]["schema"]["additionalProperties"] is False
+def test_windows_and_budget_boundaries(app):
+    from src.plugins.word_pulse.core.budget import take
+    from src.plugins.word_pulse.core.timeutil import TZ, day_of, window_bounds
+    now = int(datetime(2026, 10, 16, tzinfo=TZ).timestamp())
+    assert window_bounds(now, 1) == (now, now + 1)
+    assert day_of(now - 1) == "2026-10-15"
+    assert take(-1, 10) == 0
+    assert take(3, 10) == 3
+    assert take(10, 3) == 3

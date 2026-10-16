@@ -35,10 +35,11 @@ def refine_ai_config(live_ai_config: None) -> None:
 
 @pytest.fixture
 def word_pulse_ai_config(live_ai_config: None) -> None:
-    from src.plugins.word_pulse import _validate_config
+    from src.plugins.ai_provider import resolve
+    from src.plugins.word_pulse.classifiers import CLASSIFY_CALLER
 
-    if missing := _validate_config():
-        pytest.skip(missing)
+    if missing := resolve(CLASSIFY_CALLER).missing:
+        pytest.skip(missing[0])
 
 
 @pytest.fixture
@@ -75,131 +76,34 @@ async def test_refine_summary_real_api(refine_ai_config: None) -> None:
     assert len(summary) < 2000
 
 
-# ── 测试 2: word_pulse _request_llm 走严格结构化输出 ──────────
+@pytest.mark.live_ai
+@pytest.mark.parametrize("mode", ["strict", "json"])
+async def test_word_pulse_classification_real_api(word_pulse_ai_config, mode):
+    """Exercise the actual classification adapter using synthetic text only."""
+    from src.plugins.word_pulse.classifiers import AIClassifier
+    from tests.test_word_pulse_ai_provider import _inputs
+
+    result = await AIClassifier(batch_size=50, output_mode=mode, timeout=60).classify(*_inputs())
+    assert result.labels
+    assert not result.unclassified
 
 
 @pytest.mark.live_ai
-@pytest.mark.asyncio
-async def test_word_pulse_request_llm_strict_schema_real_api(
-    word_pulse_ai_config: None,
-) -> None:
-    """验证业务 Pydantic 模型经真实接口生成、发送并解析 JSON Schema。"""
-    from src.plugins.word_pulse.ai import (
-        BatchClassificationResponse,
-        _request_llm,
-    )
+async def test_word_pulse_trend_real_api(live_ai_config):
+    from src.plugins.ai_provider import resolve
+    from src.plugins.word_pulse.classifiers import SUMMARY_CALLER
+    from src.plugins.word_pulse.core.aggregate import ClusterCounts, build
+    from src.plugins.word_pulse.report import _trend_sentence
+    from tests.test_word_pulse_ai_provider import _inputs
 
-    result = await _request_llm(
-        response_model=BatchClassificationResponse,
-        system="你是分类助手，请按给定结构返回结果。",
-        messages=[
-            {"role": "user", "content": "消息 [1] 测试；将 cluster 设为 null"},
-        ],
-        temperature=0.0,
-        timeout_seconds=60.0,
-    )
-    assert isinstance(result, BatchClassificationResponse)
-    assert result.results
-    assert result.results[0].id == 1
-
-
-# ── 测试 3: word_pulse expand_charsets 真实可用 ───────────────────────
-
-
-@pytest.mark.live_ai
-@pytest.mark.asyncio
-async def test_word_pulse_expand_charsets_real_api(
-    word_pulse_ai_config: None,
-) -> None:
-    """验证 ``expand_charsets`` 真实可用,返回符合 pydantic schema。
-
-    bug#3 现场:用户报告字符集扩展失败。这个测试模拟真实调用。
-    """
-    from src.plugins.word_pulse.ai import expand_charsets
-
-    result = await expand_charsets(
-        seeds=["新能源", "半导体"],
-        theme="板块",
-        temperature=0.0,
-        timeout=60.0,
-    )
-    assert isinstance(result, dict)
-    assert "新能源" in result
-    assert "半导体" in result
-    # 每个 cluster 的 chars 数组符合 pydantic 约束(5-30 个)
-    for cluster, chars in result.items():
-        assert 5 <= len(chars) <= 30, (
-            f"cluster {cluster} chars 数量 {len(chars)} 不在 5-30 范围"
-        )
-
-
-# ── 测试 4: word_pulse classify_batch 真实可用 ────────────────────────
-
-
-@pytest.mark.live_ai
-@pytest.mark.asyncio
-async def test_word_pulse_classify_batch_real_api(
-    word_pulse_ai_config: None,
-) -> None:
-    """验证 ``classify_batch`` 真实可用。"""
-    from src.plugins.word_pulse.ai import classify_batch
-
-    messages = [
-        (1, "新能源车销量大涨"),
-        (2, "半导体缺货"),
-        (3, "今天天气不错"),  # 应归 null
-    ]
-    result = await classify_batch(
-        messages=messages,
-        clusters=[
-            {"name": "新能源", "aliases": []},
-            {"name": "半导体", "aliases": []},
-        ],
-        theme_name="板块",
-        temperature=0.0,
-        timeout=60.0,
-    )
-    assert len(result) == 3
-    # 至少有 1 条被归到某个 cluster(不是全 null)
-    non_null = [r for r in result if r[1] is not None]
-    assert len(non_null) >= 1
-
-
-# ── 测试 5: word_pulse summarize 真实可用,符合 SummaryResult schema ──
-
-
-@pytest.mark.live_ai
-@pytest.mark.asyncio
-async def test_word_pulse_summarize_real_api(
-    word_pulse_ai_config: None,
-) -> None:
-    """验证 ``summarize`` 真实可用,返回符合 ``SummaryResult`` schema。"""
-    from src.plugins.word_pulse.ai import summarize
-
-    prompt = (
-        "主题:板块\n"
-        "时间范围:7天\n"
-        "子类:\n"
-        "- 新能源\n"
-        "- 半导体\n\n"
-        "日桶统计:\n"
-        "  [2026-08-04] 总100条 | 新能源:50, 半导体:30, _other:20\n\n"
-        "典型原文:\n"
-        "  [2026-08-04] 张三: 新能源继续强势"
-    )
-
-    result = await summarize(
-        prompt=prompt,
-        temperature=0.3,
-        timeout=60.0,
-    )
-    assert result.trend  # 非空字符串
-    assert len(result.ranking) > 0
-    # 验证 ranking 字段类型
-    for item in result.ranking:
-        assert isinstance(item.cluster, str)
-        assert isinstance(item.count, int)
-        assert isinstance(item.percent, (int, float))
+    if missing := resolve(SUMMARY_CALLER).missing:
+        pytest.skip(missing[0])
+    theme = _inputs()[1][0]
+    data = build(theme, 1, cur_clusters=[ClusterCounts(10, 2, 2)], prev_clusters=[],
+                 cur_relevant=(2, 2), daily_rows=[(1, 10, 1800000000), (2, 10, 1800000000)],
+                 unclassified=0, data_as_of=1800000000, semantic_enabled=True, now=1800000000)
+    trend = await _trend_sentence(data)
+    assert trend and len(trend) <= 60
 
 
 # ── 测试 6: refine 多人 prompt 真实能综合多人观点 ─────────────────────

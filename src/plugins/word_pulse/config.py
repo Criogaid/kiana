@@ -1,22 +1,37 @@
-# src/plugins/word_pulse/config.py
+"""Word Pulse operational configuration and command limits."""
+
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 from src.plugins.group_permission import GroupPermissionMixin
 
-# ── 不可调常量（细枝末节，硬编码避免污染配置）──
-CLASSIFY_TEMPERATURE: float = 0.0       # 字符集扩展 + 灰区分类
-SUMMARY_TEMPERATURE: float = 0.3        # 最终热度总结
-REQUEST_TIMEOUT_SECONDS: float = 60.0   # 单次 AI 请求超时
-QUERY_COOLDOWN_SECONDS: int = 30        # 同群查询冷却
-RESULT_CACHE_TTL_SECONDS: int = 300     # 结果缓存 TTL（5 分钟）
-TODAY_BUCKET_FRESH_SECONDS: int = 300   # 今日桶 freshness 窗口
-MAX_EXAMPLES_IN_SUMMARY: int = 5        # 总结里典型原文条数
+BATCH_SIZE = 50
+LIVE_MAX_PER_TICK = 1000
+BACKFILL_MAX_PER_TICK = 500
+FAIL_SKIP_THRESHOLD = 3
+CLASSIFY_TIMEOUT = 60.0
+TREND_TIMEOUT = 15.0
+MAX_WINDOW_DAYS = 31
+DEFAULT_WINDOW_DAYS = 7
+RESULT_CACHE_TTL = 300
+QUERY_COOLDOWN = 30
+MAX_TEXT_CHARS = 300
+MAX_NAME_CHARS = 20
+MAX_DESCRIPTION_CHARS = 50
+MAX_TREND_CHARS = 60
+MAX_EXAMPLE_CHARS = 40
+MAX_EXAMPLE_CLUSTERS = 3
 
 
 class Config(GroupPermissionMixin, BaseModel):
-    word_pulse_plugin_enabled: bool = Field(default=False, description="是否启用词频统计插件")
-    # AI 档案与模型由 ai_provider 按 caller="word_pulse" 统一解析。
-    word_pulse_bucket_retention_days: int = Field(default=30, ge=1, le=365, description="桶保留天数")
-    word_pulse_max_messages_per_bucket: int = Field(default=1000, ge=100, le=10000, description="单桶消息上限")
-    word_pulse_max_sample_per_cluster: int = Field(default=3, ge=1, le=10, description="每cluster抽样条数")
-    word_pulse_max_window_days: int = Field(default=31, ge=1, le=365, description="查询窗口上限天")
+    word_pulse_plugin_enabled: bool = False
+    word_pulse_ai_daily_budget: int = Field(2000, ge=0)
+    word_pulse_ai_output_mode: Literal["strict", "json"] = "strict"
+    word_pulse_tick_minutes: int = Field(10, ge=1, le=60)
+    word_pulse_backfill_days: int = Field(7, ge=1, le=31)
+    word_pulse_label_retention_days: int = Field(31, ge=7, le=365)
+    word_pulse_show_examples: bool = False
+    word_pulse_group_mode: Literal["all", "whitelist", "blacklist"] = "all"
+    word_pulse_group_whitelist: list[str] = Field(default_factory=list)
+    word_pulse_group_blacklist: list[str] = Field(default_factory=list)

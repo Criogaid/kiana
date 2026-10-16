@@ -9,6 +9,7 @@ from typing import Literal
 from nonebot import logger, require
 from pydantic import BaseModel, Field, ValidationError
 
+from .config import MAX_TEXT_CHARS
 from .core.merge import AIVerdict, merge
 from .core.text import LiteralMatcher, normalize
 from .core.timeutil import day_of
@@ -24,7 +25,6 @@ from .errors import (
 _ai = require("src.plugins.ai_provider")
 CLASSIFY_CALLER = "word_pulse.classify"
 SUMMARY_CALLER = "word_pulse.summary"
-MAX_TEXT_CHARS = 300
 AI_ERRORS = _ai.AIErrorTypes(
     timeout=WordPulseAITimeoutError,
     auth=WordPulseAIAuthError,
@@ -172,7 +172,9 @@ class AIClassifier:
         )
         logger.debug("Word Pulse classification usage: {}", result.usage)
         try:
-            return BatchVerdict.model_validate_json(_ai.extract_json_text(result.text))
+            return BatchVerdict.model_validate_json(
+                _ai.extract_json_text(result.text, errors=AI_ERRORS)
+            )
         except (ValidationError, ValueError) as error:
             raise WordPulseAIResponseError("AI response: invalid classification JSON") from error
 

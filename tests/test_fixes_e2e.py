@@ -1,29 +1,14 @@
-"""本次 4 个 bug 修复 + help 命令的集中端到端集成验证。
-
-覆盖场景:
-1. **bug#1**:`炼化这个功能怎么用`(无空格粘连)不应触发任何炼化命令 — force_whitespace=True
-2. **bug#1 对照**:`炼化 <不存在标签>`(有空格)正常进入 handler 并回「未找到标签」
-3. **bug#2**:集合订阅炼化时,所有成员的发言都被采到 prompt 里(per-member 配额)
-4. **strict output**:word_pulse 把 Pydantic 业务模型作为 JSON Schema 发送
-5. **help**:`词频 帮助` 与 `词频 help` 都能触发并返回完整帮助文案
-
-复用 conftest.py 的 `App` fixture 与 autouse 的 `reset_*` 表清理 fixture。
-事件、API 预期和响应工厂复用 tests.refine_helpers。
-
-不修改任何源代码、不修改其他测试。
-"""
+"""Refine regression checks; Word Pulse contracts live in its dedicated suites."""
 
 from __future__ import annotations
 
 import json as json_lib
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
-import httpx2
 from tests.ai_mock_transport import AI_HTTP_TARGET, AIHttpMock
 import pytest
 from nonebot.adapters.onebot.v11 import (
     Bot,
-    Message,
 )
 from nonebug import App
 
@@ -235,117 +220,3 @@ async def test_bug2_collection_refine_covers_all_members(app: App) -> None:
     assert "成员111" in prompt_text, f"成员111 缺失: {prompt_text}"
     assert "成员222" in prompt_text, f"成员222 缺失: {prompt_text}"
     assert "成员333" in prompt_text, f"成员333 缺失: {prompt_text}"
-
-
-# ═══════════════════════════════════════════════════════════════
-# 场景 4: word_pulse 使用严格 JSON Schema
-@pytest.mark.asyncio
-async def test_word_pulse_uses_strict_json_schema(app: App) -> None:
-    """字符集扩展必须把 Pydantic 契约交给 SDK，而不是只请求 JSON 对象。"""
-    from src.plugins.word_pulse.ai import expand_charsets  # noqa: PLC0415
-
-    captured_body: dict = {}
-
-    def word_pulse_handler(request: httpx2.Request) -> httpx2.Response:
-        captured_body.update(json_lib.loads(request.content))
-        return httpx2.Response(
-            200,
-            json={
-                "choices": [
-                    {
-                        "finish_reason": "stop",
-                        "message": {
-                            "role": "assistant",
-                            "content": json_lib.dumps(
-                                {
-                                    "charsets": [
-                                        {
-                                            "cluster": "测试种子",
-                                            "chars": ["字"] * 5,
-                                        }
-                                    ]
-                                }
-                            ),
-                        },
-                    }
-                ]
-            },
-        )
-
-    with patch(AI_HTTP_TARGET, new=AIHttpMock(word_pulse_handler)):
-        result = await expand_charsets(seeds=["测试种子"], theme="测试主题")
-
-    assert "测试种子" in result
-    response_format = captured_body["response_format"]
-    assert response_format["type"] == "json_schema"
-    assert response_format["json_schema"]["strict"] is True
-    schema = response_format["json_schema"]["schema"]
-    assert schema["additionalProperties"] is False
-    assert "charsets" in schema["required"]
-
-
-# ═══════════════════════════════════════════════════════════════
-# 场景 5: help — `词频 帮助` / `词频 help` 都触发并返回完整文案
-# ═══════════════════════════════════════════════════════════════
-
-
-# 与 word_pulse.handle_help 内联文案保持一致(独立常量,避免源码改动时文案
-# 微调让本测试 flaky)。如果未来 handle_help 文案变化,这里同步更新即可。
-EXPECTED_HELP_TEXT = "\n".join(
-    [
-        "📊 词频插件帮助",
-        "",
-        "群聊主题词频统计 — 创建主题 → AI 日桶分类 → 热度总结。",
-        "",
-        "管理命令(需群管理员/Bot 管理员):",
-        "  词频 add <主题> <种子词1> <种子词2> ...   创建主题",
-        "  词频 append <主题> <种子词...>            追加子类",
-        "  词频 list                                 列出本群主题",
-        "  词频 del <主题>                           删除主题",
-        "  词频 del <主题> <子类>                    删除子类",
-        "  词频 refresh <主题>                       刷新字符集(AI 扩展)",
-        "  词频 alias <主题> <主名词> <别名...>      给子类加别名",
-        "  词频 unalias <主题> <主名词> <别名...>    删除子类别名",
-        "",
-        "查询命令(所有人可用):",
-        "  总结 <N>天/周/月 <主题>                  查询热度统计(例: 总结 7天 炒股)",
-        "",
-        "时间单位: 天/d, 周/w, 月/m",
-    ]
-)
-
-
-@pytest.mark.asyncio
-async def test_help_command_triggers_for_word_pulse_help_cn(
-    app: App, monkeypatch
-) -> None:
-    """help: `词频 帮助` 触发并返回完整帮助文案。"""
-    from src.plugins import word_pulse  # noqa: PLC0415
-
-    monkeypatch.setattr(word_pulse.config, "word_pulse_plugin_enabled", True)
-
-    event = _make_group_event("词频 帮助", message_id=500, group_id=300001)
-    async with app.test_matcher(word_pulse.help_matcher) as ctx:
-        bot = ctx.create_bot(base=Bot, self_id="987654321")
-        _expect_bot_not_muted(ctx, group_id=300001)
-        ctx.receive_event(bot, event)
-        ctx.should_pass_rule()
-        ctx.should_call_send(event, EXPECTED_HELP_TEXT, result={"message_id": 501})
-
-
-@pytest.mark.asyncio
-async def test_help_command_triggers_for_word_pulse_help_en(
-    app: App, monkeypatch
-) -> None:
-    """help: `词频 help`(英文别名)同样触发并返回完整文案。"""
-    from src.plugins import word_pulse  # noqa: PLC0415
-
-    monkeypatch.setattr(word_pulse.config, "word_pulse_plugin_enabled", True)
-
-    event = _make_group_event("词频 help", message_id=501, group_id=300001)
-    async with app.test_matcher(word_pulse.help_matcher) as ctx:
-        bot = ctx.create_bot(base=Bot, self_id="987654321")
-        _expect_bot_not_muted(ctx, group_id=300001)
-        ctx.receive_event(bot, event)
-        ctx.should_pass_rule()
-        ctx.should_call_send(event, EXPECTED_HELP_TEXT, result={"message_id": 502})

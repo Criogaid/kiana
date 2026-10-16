@@ -15,7 +15,7 @@ from tests.test_live_ai_integration import (
     "caller, fixture, expected_model",
     [
         ("refine", refine_ai_config, "refine-model"),
-        ("word_pulse", word_pulse_ai_config, "word-model"),
+        ("word_pulse.classify", word_pulse_ai_config, "word-model"),
         ("a_share_sentiment", sentiment_ai_config, "sentiment-model"),
     ],
 )
@@ -38,7 +38,7 @@ def test_live_fixture_uses_configured_route_and_restores_state(
     monkeypatch.setattr(driver_config, "ai_default_model", "configured/default-model", raising=False)
     monkeypatch.setattr(driver_config, "ai_plugin_models", {
         "refine": "configured/refine-model",
-        "word_pulse": "configured/word-model",
+        "word_pulse.classify": "configured/word-model",
         "a_share_sentiment": "configured/sentiment-model",
     }, raising=False)
     previous = ai_config.model_dump()

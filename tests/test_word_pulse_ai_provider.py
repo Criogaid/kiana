@@ -51,7 +51,7 @@ def _install(protocol):
         "base_url": "https://word.example/v1", "api_key": "word-key",
         "models": ["word-model"], "max_tokens": 2048, "temperature_policy": "send",
     }]
-    config.ai_plugin_models = {"word_pulse": "word/word-model"}
+    config.ai_plugin_models = {"word_pulse.classify": "word/word-model"}
 
 
 def _wire_schema(protocol: str, body: dict) -> dict:
@@ -66,110 +66,53 @@ def _wire_schema(protocol: str, body: dict) -> dict:
     return body["output_config"]["format"]["schema"]
 
 
+def _inputs():
+    from src.plugins.word_pulse.core.types import ClusterRule, Msg, ThemeRule
+    return [Msg(99, 100, "private-user-id", "今天茅子涨了")], [
+        ThemeRule(1, "private-group", "炒股", "semantic", 1, 1, None, None,
+                  (ClusterRule(10, "茅台", ("茅子",), "白酒公司"),))
+    ]
+
+
 @pytest.mark.parametrize("protocol", ["openai_chat", "openai_responses", "anthropic_messages"])
-@pytest.mark.parametrize("operation", ["expand", "classify", "summarize"])
-async def test_word_pulse_operations_use_shared_route_and_strict_schema(protocol, operation):
-    from src.plugins.word_pulse.ai import classify_batch, expand_charsets, summarize
-
+@pytest.mark.parametrize("mode", ["strict", "json"])
+async def test_classification_uses_shared_route_and_payload(protocol, mode):
+    from src.plugins.word_pulse.classifiers import AIClassifier
     _install(protocol)
-    payloads = {
-        "expand": {"charsets": [{"cluster": "茅台", "chars": ["茅", "台", "酒", "业", "股"]}]},
-        "classify": {"results": [{"id": 1, "cluster": "茅台"}]},
-        "summarize": {
-            "ranking": [], "trend": "讨论增加", "examples": [],
-            "unclassified_high_freq": [],
-        },
-    }
-    content = json.dumps(payloads[operation], ensure_ascii=False)
-    with mock_ai_http(
-        lambda request: httpx2.Response(200, json=_reply(protocol, content))
-    ) as http:
-        if operation == "expand":
-            result = await expand_charsets(seeds=["茅台"], theme="炒股")
-            assert result == {"茅台": ["茅", "台", "酒", "业", "股"]}
-        elif operation == "classify":
-            result = await classify_batch(
-                messages=[(1, "茅子涨了")], clusters=[{"name": "茅台"}], theme_name="炒股"
-            )
-            assert result == [(1, "茅台")]
-        else:
-            result = await summarize(prompt="炒股统计")
-            assert result.trend == "讨论增加"
-
+    content = json.dumps({"results": [{"i": 0, "hits": [{"theme": "炒股", "clusters": ["茅台"]}]}]}, ensure_ascii=False)
+    with mock_ai_http(lambda request: httpx2.Response(200, json=_reply(protocol, content))) as http:
+        result = await AIClassifier(batch_size=50, output_mode=mode, timeout=10).classify(*_inputs())
+    assert [(label.archive_id, label.cluster_id) for label in result.labels] == [(99, 10)]
+    assert not result.unclassified
     assert len(http.requests) == 1
     body = http.bodies()[0]
     assert body["model"] == "word-model"
-    request = http.requests[0]
-    assert request.url.host == "word.example"
-    schema = _wire_schema(protocol, body)
-    assert schema["additionalProperties"] is False
-    assert schema["required"]
-    if operation == "classify":
-        input_messages = body["input"] if protocol == "openai_responses" else body["messages"]
-        user_content = next(message["content"] for message in input_messages if message["role"] == "user")
-        assert json.loads(user_content) == {
-            "theme": "炒股",
-            "clusters": [{"name": "茅台", "aliases": []}],
-            "messages": [{"id": 1, "text": "茅子涨了"}],
-        }
-    if protocol == "anthropic_messages":
-        assert request.url.path == "/v1/messages"
-        assert request.headers["x-api-key"] == "word-key"
-        assert body["max_tokens"] == 2048
-        assert "temperature" not in body
-    else:
-        assert request.headers["authorization"] == "Bearer word-key"
-        assert body["store"] is False
-        assert body["temperature"] == (0.3 if operation == "summarize" else 0.0)
-        if protocol == "openai_chat":
-            assert request.url.path == "/v1/chat/completions"
-            assert body["max_completion_tokens"] == 2048
-        else:
-            assert request.url.path == "/v1/responses"
-            assert body["max_output_tokens"] == 2048
+    assert http.requests[0].url.host == "word.example"
+    if mode == "strict":
+        assert _wire_schema(protocol, body)["additionalProperties"] is False
+    messages = body["input"] if protocol == "openai_responses" else body["messages"]
+    payload = json.loads(next(item["content"] for item in messages if item["role"] == "user"))
+    assert payload["messages"] == [{"i": 0, "text": "今天茅子涨了"}]
+    assert payload["themes"][0]["clusters"][0]["aliases"] == ["茅子"]
+    assert "private-user-id" not in json.dumps(payload)
+    assert "private-group" not in json.dumps(payload)
 
 
 @pytest.mark.parametrize("protocol", ["openai_chat", "openai_responses", "anthropic_messages"])
 @pytest.mark.parametrize("failure", ["truncated", "refused"])
-async def test_word_pulse_rejects_incomplete_or_refused_output(protocol, failure):
-    from src.plugins.word_pulse.ai import (
-        BatchClassificationResponse,
-        WordPulseAIResponseError,
-        _request_llm,
-    )
-
+async def test_classification_rejects_incomplete_or_refused_output(protocol, failure):
+    from src.plugins.word_pulse.classifiers import AIClassifier
+    from src.plugins.word_pulse.errors import WordPulseAIResponseError
     _install(protocol)
-    with (
-        mock_ai_http(
-            lambda request: httpx2.Response(
-                200, json=_reply(protocol, '{"results": []}', failure)
-            )
-        ),
-        pytest.raises(WordPulseAIResponseError),
-    ):
-        await _request_llm(
-            response_model=BatchClassificationResponse,
-            messages=[{"role": "user", "content": "测试"}],
-            temperature=0,
-            timeout_seconds=10,
-        )
+    with mock_ai_http(lambda request: httpx2.Response(200, json=_reply(protocol, '{"results": []}', failure))), pytest.raises(WordPulseAIResponseError):
+        await AIClassifier(batch_size=50, output_mode="strict", timeout=10).classify(*_inputs())
 
-async def test_word_pulse_missing_route_is_plugin_config_error_without_request():
+
+async def test_missing_route_is_config_error_without_request():
     from src.plugins.ai_provider.config import config
-    from src.plugins.word_pulse.ai import WordPulseAIConfigError, expand_charsets
-
-    config.ai_plugin_models = {"word_pulse": "missing/model"}
-    with (
-        mock_ai_http(lambda request: pytest.fail("配置错误不应发送请求")) as http,
-        pytest.raises(WordPulseAIConfigError, match="missing"),
-    ):
-        await expand_charsets(seeds=["茅台"], theme="炒股")
+    from src.plugins.word_pulse.classifiers import AIClassifier
+    from src.plugins.word_pulse.errors import WordPulseAIConfigError
+    config.ai_plugin_models = {"word_pulse.classify": "missing/model"}
+    with mock_ai_http(lambda request: pytest.fail("must not send")) as http, pytest.raises(WordPulseAIConfigError):
+        await AIClassifier(batch_size=50, output_mode="strict", timeout=10).classify(*_inputs())
     assert not http.requests
-
-
-def test_word_pulse_config_no_longer_owns_endpoint():
-    from src.plugins.word_pulse.config import Config
-
-    assert not {
-        "word_pulse_base_url", "word_pulse_api_key", "word_pulse_model",
-    } & Config.model_fields.keys()

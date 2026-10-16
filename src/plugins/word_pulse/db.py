@@ -1,78 +1,56 @@
-# src/plugins/word_pulse/db.py
+"""Transactional rules, classification checkpoints, and read-only label aggregates."""
+
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
+from collections.abc import Sequence
+from dataclasses import dataclass
+
+from pydantic import TypeAdapter
 
 from src.storage import get_db
 
-db = get_db()
+from .core.aggregate import ClusterCounts, ReportData, build
+from .core.text import normalize
+from .core.timeutil import SECONDS_PER_DAY, day_of, window_bounds
+from .core.types import ClassifyOutcome, ClusterRule, ThemeMode, ThemeRule
 
+db = get_db()
+_ALIASES = TypeAdapter(list[str])
+_MODE = TypeAdapter(ThemeMode)
 SCHEMA_STATEMENTS = [
     """CREATE TABLE IF NOT EXISTS word_pulse_theme (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        group_id TEXT NOT NULL,
-        name TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL,
-        UNIQUE(group_id, name)
-    )""",
+        id INTEGER PRIMARY KEY AUTOINCREMENT, group_id TEXT NOT NULL, name TEXT NOT NULL,
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(group_id, name))""",
     """CREATE TABLE IF NOT EXISTS word_pulse_cluster (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         theme_id INTEGER NOT NULL REFERENCES word_pulse_theme(id) ON DELETE CASCADE,
-        name TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        UNIQUE(theme_id, name)
-    )""",
-    """CREATE TABLE IF NOT EXISTS word_pulse_charset (
-        cluster_id INTEGER PRIMARY KEY REFERENCES word_pulse_cluster(id) ON DELETE CASCADE,
-        chars_json TEXT NOT NULL,
-        expanded_at INTEGER NOT NULL
-    )""",
-    """CREATE TABLE IF NOT EXISTS word_pulse_bucket (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        group_id TEXT NOT NULL,
-        theme_id INTEGER NOT NULL REFERENCES word_pulse_theme(id) ON DELETE CASCADE,
-        day TEXT NOT NULL,
-        counts_json TEXT NOT NULL,
-        samples_json TEXT NOT NULL,
-        total_messages INTEGER NOT NULL,
-        sampled INTEGER NOT NULL DEFAULT 0,
-        computed_at INTEGER NOT NULL,
-        UNIQUE(group_id, theme_id, day)
-    )""",
+        name TEXT NOT NULL, created_at INTEGER NOT NULL, UNIQUE(theme_id, name))""",
     "CREATE INDEX IF NOT EXISTS idx_word_pulse_theme_group ON word_pulse_theme(group_id)",
     "CREATE INDEX IF NOT EXISTS idx_word_pulse_cluster_theme ON word_pulse_cluster(theme_id)",
-    "CREATE INDEX IF NOT EXISTS idx_word_pulse_bucket_lookup ON word_pulse_bucket(group_id, theme_id, day)",
     """CREATE TABLE IF NOT EXISTS word_pulse_label (
         theme_id INTEGER NOT NULL, archive_id INTEGER NOT NULL, cluster_id INTEGER NOT NULL,
         source TEXT NOT NULL, rules_version INTEGER NOT NULL, user_id TEXT NOT NULL,
-        event_time INTEGER NOT NULL, PRIMARY KEY(theme_id, archive_id, cluster_id)
-    )""",
+        event_time INTEGER NOT NULL, PRIMARY KEY(theme_id, archive_id, cluster_id))""",
     "CREATE INDEX IF NOT EXISTS idx_word_pulse_label_theme_time "
     "ON word_pulse_label(theme_id, rules_version, event_time)",
     """CREATE TABLE IF NOT EXISTS word_pulse_unclassified (
         theme_id INTEGER NOT NULL, day TEXT NOT NULL, rules_version INTEGER NOT NULL,
-        count INTEGER NOT NULL, PRIMARY KEY(theme_id, day, rules_version)
-    )""",
+        count INTEGER NOT NULL, PRIMARY KEY(theme_id, day, rules_version))""",
     """CREATE TABLE IF NOT EXISTS word_pulse_cursor (
-        group_id TEXT PRIMARY KEY, last_archive_id INTEGER NOT NULL, updated_at INTEGER NOT NULL
-    )""",
+        group_id TEXT PRIMARY KEY, last_archive_id INTEGER NOT NULL, updated_at INTEGER NOT NULL)""",
     """CREATE TABLE IF NOT EXISTS word_pulse_budget (
         group_id TEXT NOT NULL, day TEXT NOT NULL, used INTEGER NOT NULL,
-        PRIMARY KEY(group_id, day)
-    )""",
+        PRIMARY KEY(group_id, day))""",
+    "DROP TABLE IF EXISTS word_pulse_charset",
+    "DROP TABLE IF EXISTS word_pulse_bucket",
 ]
 
 
 def ensure_schema() -> None:
     db.ensure_schema(SCHEMA_STATEMENTS)
-    _ensure_aliases_column()
-    _ensure_rule_columns()
-
-
-def _ensure_rule_columns() -> None:
-    """Upgrade existing rules without dropping old buckets before the P3 cutover."""
     columns = {
         "word_pulse_theme": {
             "mode": "TEXT NOT NULL DEFAULT 'semantic'",
@@ -81,339 +59,501 @@ def _ensure_rule_columns() -> None:
             "backfill_next_id": "INTEGER",
             "backfill_until_id": "INTEGER",
         },
-        "word_pulse_cluster": {"description": "TEXT NOT NULL DEFAULT ''"},
+        "word_pulse_cluster": {
+            "description": "TEXT NOT NULL DEFAULT ''",
+            "aliases_json": "TEXT NOT NULL DEFAULT '[]'",
+        },
     }
     with db._conn:
         for table, definitions in columns.items():
             existing = {row[1] for row in db._conn.execute(f"PRAGMA table_info({table})")}
             for name, definition in definitions.items():
                 if name not in existing:
-                    # Identifiers and declarations come only from the static mapping above.
+                    # All interpolated identifiers come from the static mapping above.
                     db._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
 
-def _ensure_aliases_column() -> None:
-    """为旧库补齐 word_pulse_cluster.aliases_json 列。
-
-    SQLite 不支持 ADD COLUMN IF NOT EXISTS，用 PRAGMA 检测后补列。
-    """
-    cols = {row[1] for row in db._conn.execute("PRAGMA table_info(word_pulse_cluster)").fetchall()}
-    if "aliases_json" not in cols:
-        db._conn.execute(
-            "ALTER TABLE word_pulse_cluster ADD COLUMN aliases_json TEXT NOT NULL DEFAULT '[]'"
+def _clusters(conn: sqlite3.Connection, theme_id: int) -> tuple[ClusterRule, ...]:
+    return tuple(
+        ClusterRule(
+            row["id"],
+            row["name"],
+            tuple(_ALIASES.validate_json(row["aliases_json"])),
+            row["description"],
         )
-
-
-# ── Theme ──
-
-
-async def upsert_theme(group_id: str, name: str) -> int:
-    """创建或更新主题。返回 theme_id。"""
-    now = int(time.time())
-    row = await db.fetch_one(
-        "SELECT id FROM word_pulse_theme WHERE group_id = ? AND name = ?",
-        (group_id, name),
-    )
-    if row:
-        await db.execute(
-            "UPDATE word_pulse_theme SET updated_at = ? WHERE id = ?",
-            (now, row["id"]),
+        for row in conn.execute(
+            "SELECT * FROM word_pulse_cluster WHERE theme_id=? ORDER BY id", (theme_id,)
         )
-        return row["id"]
-    await db.execute(
-        "INSERT INTO word_pulse_theme (group_id, name, created_at, updated_at) VALUES (?, ?, ?, ?)",
-        (group_id, name, now, now),
     )
-    row = await db.fetch_one(
-        "SELECT id FROM word_pulse_theme WHERE group_id = ? AND name = ?",
-        (group_id, name),
-    )
-    assert row is not None
-    return row["id"]
 
 
-async def get_theme(group_id: str, name: str) -> dict | None:
-    """按群+名称查找主题，返回行 dict 或 None。"""
-    row = await db.fetch_one(
-        "SELECT id, group_id, name, created_at, updated_at FROM word_pulse_theme WHERE group_id = ? AND name = ?",
-        (group_id, name),
+def _theme(conn: sqlite3.Connection, row: sqlite3.Row) -> ThemeRule:
+    return ThemeRule(
+        row["id"],
+        row["group_id"],
+        row["name"],
+        _MODE.validate_python(row["mode"]),
+        row["rules_version"],
+        row["backfill_version"],
+        row["backfill_next_id"],
+        row["backfill_until_id"],
+        _clusters(conn, row["id"]),
     )
-    return None if row is None else dict(row)
 
 
-async def list_themes(group_id: str) -> list[dict]:
-    """列出指定群的所有主题。"""
-    rows = await db.fetch_all(
-        "SELECT id, group_id, name, created_at, updated_at FROM word_pulse_theme WHERE group_id = ? ORDER BY updated_at DESC",
-        (group_id,),
+async def get_theme(group_id: str, name: str) -> ThemeRule | None:
+    def read(conn: sqlite3.Connection) -> ThemeRule | None:
+        row = conn.execute(
+            "SELECT * FROM word_pulse_theme WHERE group_id=? AND name=?", (group_id, name)
+        ).fetchone()
+        return _theme(conn, row) if row else None
+
+    return await db.transaction(read)
+
+
+async def list_themes(group_id: str) -> list[ThemeRule]:
+    def read(conn: sqlite3.Connection) -> list[ThemeRule]:
+        return [
+            _theme(conn, row)
+            for row in conn.execute(
+                "SELECT * FROM word_pulse_theme WHERE group_id=? ORDER BY id", (group_id,)
+            )
+        ]
+
+    return await db.transaction(read)
+
+
+async def list_groups_with_themes() -> list[str]:
+    return [
+        row["group_id"]
+        for row in await db.fetch_all(
+            "SELECT DISTINCT group_id FROM word_pulse_theme ORDER BY group_id"
+        )
+    ]
+
+
+@dataclass(frozen=True, slots=True)
+class RuleChange:
+    added: tuple[str, ...]
+    conflicts: tuple[tuple[str, str], ...]
+    created: bool = False
+
+
+def _touch(conn: sqlite3.Connection, theme_id: int) -> None:
+    conn.execute(
+        "UPDATE word_pulse_theme SET rules_version=rules_version+1, updated_at=? WHERE id=?",
+        (int(time.time()), theme_id),
     )
-    return [dict(r) for r in rows]
+
+
+def _owners(clusters: Sequence[ClusterRule]) -> dict[str, str]:
+    owners = {}
+    for cluster in clusters:
+        owners[normalize(cluster.name)] = "已是子类"
+        for alias in cluster.aliases:
+            owners[normalize(alias)] = f"已是「{cluster.name}」的别名"
+    return owners
+
+
+async def add_clusters(group_id: str, theme_name: str, names: Sequence[str]) -> RuleChange:
+    def operation(conn: sqlite3.Connection) -> RuleChange:
+        now = int(time.time())
+        row = conn.execute(
+            "SELECT id FROM word_pulse_theme WHERE group_id=? AND name=?", (group_id, theme_name)
+        ).fetchone()
+        created = row is None
+        if row is None:
+            conn.execute(
+                "INSERT INTO word_pulse_theme(group_id,name,created_at,updated_at) VALUES(?,?,?,?)",
+                (group_id, theme_name, now, now),
+            )
+            row = conn.execute(
+                "SELECT id FROM word_pulse_theme WHERE group_id=? AND name=?",
+                (group_id, theme_name),
+            ).fetchone()
+        theme_id = row["id"]
+        owners = _owners(_clusters(conn, theme_id))
+        added, conflicts = [], []
+        for name in names:
+            key = normalize(name)
+            if key in owners:
+                conflicts.append((name, owners[key]))
+                continue
+            conn.execute(
+                "INSERT INTO word_pulse_cluster(theme_id,name,created_at) VALUES(?,?,?)",
+                (theme_id, name, now),
+            )
+            added.append(name)
+            owners[key] = "已是子类"
+        if added and not created:
+            _touch(conn, theme_id)
+        return RuleChange(tuple(added), tuple(conflicts), created)
+
+    return await db.transaction(operation)
+
+
+async def remove_clusters(theme_id: int, names: Sequence[str]) -> list[str]:
+    def operation(conn: sqlite3.Connection) -> list[str]:
+        wanted = {normalize(name) for name in names}
+        removed = []
+        for cluster in _clusters(conn, theme_id):
+            if normalize(cluster.name) in wanted:
+                conn.execute("DELETE FROM word_pulse_cluster WHERE id=?", (cluster.id,))
+                removed.append(cluster.name)
+        if removed:
+            _touch(conn, theme_id)
+        return removed
+
+    return await db.transaction(operation)
 
 
 async def delete_theme(theme_id: int) -> None:
-    """删除主题（级联删除 cluster/charset/bucket）。"""
-    await db.execute("DELETE FROM word_pulse_theme WHERE id = ?", (theme_id,))
+    def operation(conn: sqlite3.Connection) -> None:
+        conn.execute("DELETE FROM word_pulse_label WHERE theme_id=?", (theme_id,))
+        conn.execute("DELETE FROM word_pulse_unclassified WHERE theme_id=?", (theme_id,))
+        conn.execute("DELETE FROM word_pulse_theme WHERE id=?", (theme_id,))
+
+    await db.transaction(operation)
 
 
-# ── Cluster ──
+def _find_cluster(conn: sqlite3.Connection, theme_id: int, name: str) -> ClusterRule:
+    for cluster in _clusters(conn, theme_id):
+        if normalize(cluster.name) == normalize(name):
+            return cluster
+    raise ValueError(f"主题中没有子类「{name}」")
 
 
-async def replace_clusters(theme_id: int, names: list[str]) -> list[int]:
-    old = await get_clusters(theme_id)
-    old_names = {c["name"]: c["id"] for c in old}
-    new_names = set(names)
-    for c in old:
-        if c["name"] not in new_names:
-            await db.execute("DELETE FROM word_pulse_cluster WHERE id = ?", (c["id"],))
-    now = int(time.time())
-    result_ids: list[int] = []
-    for name in names:
-        if name in old_names:
-            result_ids.append(old_names[name])
-        else:
-            await db.execute(
-                "INSERT INTO word_pulse_cluster (theme_id, name, created_at) VALUES (?, ?, ?)",
-                (theme_id, name, now),
+async def add_aliases(theme_id: int, cluster_name: str, aliases: Sequence[str]) -> RuleChange:
+    def operation(conn: sqlite3.Connection) -> RuleChange:
+        cluster = _find_cluster(conn, theme_id, cluster_name)
+        owners = _owners(_clusters(conn, theme_id))
+        added, conflicts = [], []
+        for alias in aliases:
+            key = normalize(alias)
+            if key in owners:
+                conflicts.append((alias, owners[key]))
+            else:
+                added.append(alias)
+                owners[key] = f"已是「{cluster.name}」的别名"
+        if added:
+            conn.execute(
+                "UPDATE word_pulse_cluster SET aliases_json=? WHERE id=?",
+                (json.dumps([*cluster.aliases, *added], ensure_ascii=False), cluster.id),
             )
-            row = await db.fetch_one(
-                "SELECT id FROM word_pulse_cluster WHERE theme_id = ? AND name = ?",
-                (theme_id, name),
+            _touch(conn, theme_id)
+        return RuleChange(tuple(added), tuple(conflicts))
+
+    return await db.transaction(operation)
+
+
+async def remove_aliases(theme_id: int, cluster_name: str, aliases: Sequence[str]) -> list[str]:
+    def operation(conn: sqlite3.Connection) -> list[str]:
+        cluster = _find_cluster(conn, theme_id, cluster_name)
+        wanted = {normalize(alias) for alias in aliases}
+        removed = [alias for alias in cluster.aliases if normalize(alias) in wanted]
+        if removed:
+            kept = [alias for alias in cluster.aliases if normalize(alias) not in wanted]
+            conn.execute(
+                "UPDATE word_pulse_cluster SET aliases_json=? WHERE id=?",
+                (json.dumps(kept, ensure_ascii=False), cluster.id),
             )
-            assert row is not None
-            result_ids.append(row["id"])
-    return result_ids
+            _touch(conn, theme_id)
+        return removed
+
+    return await db.transaction(operation)
 
 
-async def add_clusters(theme_id: int, names: list[str]) -> list[int]:
-    existing = await get_clusters(theme_id)
-    existing_names = {c["name"] for c in existing}
-    now = int(time.time())
-    new_ids: list[int] = []
-    for name in names:
-        if name in existing_names:
-            continue
-        await db.execute(
-            "INSERT INTO word_pulse_cluster (theme_id, name, created_at) VALUES (?, ?, ?)",
-            (theme_id, name, now),
+async def set_description(theme_id: int, cluster_name: str, text: str) -> bool:
+    def operation(conn: sqlite3.Connection) -> bool:
+        cluster = _find_cluster(conn, theme_id, cluster_name)
+        if cluster.description == text:
+            return False
+        conn.execute("UPDATE word_pulse_cluster SET description=? WHERE id=?", (text, cluster.id))
+        _touch(conn, theme_id)
+        return True
+
+    return await db.transaction(operation)
+
+
+async def set_mode(theme_id: int, mode: ThemeMode) -> bool:
+    def operation(conn: sqlite3.Connection) -> bool:
+        changed = (
+            conn.execute(
+                "UPDATE word_pulse_theme SET mode=? WHERE id=? AND mode<>?", (mode, theme_id, mode)
+            ).rowcount
+            > 0
         )
-        row = await db.fetch_one(
-            "SELECT id FROM word_pulse_cluster WHERE theme_id = ? AND name = ?", (theme_id, name)
-        )
-        assert row is not None
-        new_ids.append(row["id"])
-        existing_names.add(name)
-    return new_ids
+        if changed:
+            _touch(conn, theme_id)
+        return changed
+
+    return await db.transaction(operation)
 
 
-async def get_clusters(theme_id: int) -> list[dict]:
-    rows = await db.fetch_all(
-        "SELECT id, theme_id, name, created_at, aliases_json FROM word_pulse_cluster WHERE theme_id = ? ORDER BY id",
-        (theme_id,),
-    )
-    result: list[dict] = []
-    for r in rows:
-        d = dict(r)
-        try:
-            d["aliases"] = json.loads(d.pop("aliases_json", "[]"))
-        except (json.JSONDecodeError, KeyError):
-            d["aliases"] = []
-        result.append(d)
-    return result
-
-
-async def delete_cluster(cluster_id: int) -> None:
-    await db.execute("DELETE FROM word_pulse_cluster WHERE id = ?", (cluster_id,))
-
-
-# ── Cluster aliases ──
-
-
-async def add_cluster_aliases(
-    cluster_id: int,
-    aliases: list[str],
-    *,
-    theme_id: int | None = None,
-) -> list[str]:
-    """给 cluster 追加别名。
-
-    幂等：已存在的别名不会重复添加。
-    安全：与同主题内任意 cluster 名字冲突的别名会被拒绝（防止别名变独立 cluster）。
-
-    Args:
-        cluster_id: 目标 cluster 的 id。
-        aliases: 待添加的别名列表。
-        theme_id: 用于冲突检测的主题 id；若为 None 则自动从 cluster 行读取。
-
-    Returns:
-        实际新增（去重、过滤冲突后）的别名列表。
-    """
-    if not aliases:
-        return []
-    if theme_id is None:
-        row = await db.fetch_one(
-            "SELECT theme_id FROM word_pulse_cluster WHERE id = ?",
-            (cluster_id,),
-        )
-        if row is None:
-            return []
-        theme_id = row["theme_id"]
-
-    # 同主题内所有 cluster 名字（包括自己）作为黑名单
-    existing_clusters = await db.fetch_all(
-        "SELECT name FROM word_pulse_cluster WHERE theme_id = ?",
-        (theme_id,),
-    )
-    reserved_names = {r["name"] for r in existing_clusters}
-
-    # 当前别名
+async def get_cursor(group_id: str) -> tuple[int, int] | None:
     row = await db.fetch_one(
-        "SELECT aliases_json FROM word_pulse_cluster WHERE id = ?",
-        (cluster_id,),
+        "SELECT last_archive_id,updated_at FROM word_pulse_cursor WHERE group_id=?", (group_id,)
     )
-    if row is None:
-        return []
-    try:
-        current = json.loads(row["aliases_json"])
-    except json.JSONDecodeError:
-        current = []
-    current_set = set(current)
+    return (row[0], row[1]) if row else None
 
-    added: list[str] = []
-    for a in aliases:
-        if not a or a in reserved_names or a in current_set:
-            continue
-        current_set.add(a)
-        added.append(a)
 
-    if not added:
-        return []
-    # 保序：旧别名 + 新增别名
-    merged = current + added
+async def init_cursor(group_id: str, last_id: int, now: int) -> None:
     await db.execute(
-        "UPDATE word_pulse_cluster SET aliases_json = ? WHERE id = ?",
-        (json.dumps(merged, ensure_ascii=False), cluster_id),
+        "INSERT OR IGNORE INTO word_pulse_cursor VALUES(?,?,?)", (group_id, last_id, now)
     )
-    return added
 
 
-async def remove_cluster_aliases(cluster_id: int, aliases: list[str]) -> list[str]:
-    """从 cluster 删除别名。
-
-    Args:
-        cluster_id: 目标 cluster 的 id。
-        aliases: 待删除的别名列表。
-
-    Returns:
-        实际被删除的别名列表。
-    """
-    if not aliases:
-        return []
-    row = await db.fetch_one(
-        "SELECT aliases_json FROM word_pulse_cluster WHERE id = ?",
-        (cluster_id,),
-    )
-    if row is None:
-        return []
-    try:
-        current = json.loads(row["aliases_json"])
-    except json.JSONDecodeError:
-        current = []
-    current_set = set(current)
-    to_remove = {a for a in aliases if a in current_set}
-    if not to_remove:
-        return []
-    # 保序：保留未删除的，按原顺序
-    kept = [a for a in current if a not in to_remove]
-    await db.execute(
-        "UPDATE word_pulse_cluster SET aliases_json = ? WHERE id = ?",
-        (json.dumps(kept, ensure_ascii=False), cluster_id),
-    )
-    return sorted(to_remove)
+async def touch_cursor(group_id: str, now: int) -> None:
+    await db.execute("UPDATE word_pulse_cursor SET updated_at=? WHERE group_id=?", (now, group_id))
 
 
-# ── Charset ──
-
-
-async def save_charsets(theme_id: int, charset_map: dict[str, list[str]]) -> None:
-    clusters = await get_clusters(theme_id)
-    cluster_by_name = {c["name"]: c["id"] for c in clusters}
-    now = int(time.time())
-    for name, chars in charset_map.items():
-        cid = cluster_by_name.get(name)
-        if cid is None:
-            continue
-        await db.execute(
-            """INSERT INTO word_pulse_charset (cluster_id, chars_json, expanded_at)
-               VALUES (?, ?, ?)
-               ON CONFLICT(cluster_id) DO UPDATE SET chars_json=excluded.chars_json, expanded_at=excluded.expanded_at""",
-            (cid, json.dumps(chars, ensure_ascii=False), now),
-        )
-
-
-async def get_expanded_charset(theme_id: int) -> set[str]:
-    rows = await db.fetch_all(
-        """SELECT cs.chars_json FROM word_pulse_charset cs
-           JOIN word_pulse_cluster cl ON cs.cluster_id = cl.id
-           WHERE cl.theme_id = ?""",
-        (theme_id,),
-    )
-    result: set[str] = set()
-    for row in rows:
-        result.update(json.loads(row["chars_json"]))
-    return result
-
-
-# ── Bucket ──
-
-
-async def save_bucket(
-    group_id: str,
-    theme_id: int,
-    day: str,
-    counts_json: str,
-    samples_json: str,
-    total_messages: int,
-    sampled: bool,
+async def init_backfill(
+    theme_id: int, rules_version: int, next_id: int | None, until_id: int
 ) -> None:
-    now = int(time.time())
-    sampled_int = 1 if sampled else 0
-    await db.execute(
-        """INSERT INTO word_pulse_bucket (group_id, theme_id, day, counts_json, samples_json, total_messages, sampled, computed_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(group_id, theme_id, day) DO UPDATE SET
-               counts_json=excluded.counts_json, samples_json=excluded.samples_json,
-               total_messages=excluded.total_messages, sampled=excluded.sampled, computed_at=excluded.computed_at""",
-        (group_id, theme_id, day, counts_json, samples_json, total_messages, sampled_int, now),
-    )
+    def operation(conn: sqlite3.Connection) -> None:
+        changed = conn.execute(
+            "UPDATE word_pulse_theme SET backfill_version=?,backfill_next_id=?,backfill_until_id=? WHERE id=? AND rules_version=?",
+            (rules_version, next_id, until_id, theme_id, rules_version),
+        ).rowcount
+        if changed:
+            conn.execute(
+                "DELETE FROM word_pulse_label WHERE theme_id=? AND rules_version<?",
+                (theme_id, rules_version),
+            )
+            conn.execute(
+                "DELETE FROM word_pulse_unclassified WHERE theme_id=? AND rules_version<?",
+                (theme_id, rules_version),
+            )
+
+    await db.transaction(operation)
 
 
-async def get_bucket(group_id: str, theme_id: int, day: str) -> dict | None:
+def _write_outcome(
+    conn: sqlite3.Connection, outcome: ClassifyOutcome, versions: dict[int, int]
+) -> None:
+    for label in outcome.labels:
+        if label.theme_id not in versions:
+            continue
+        conn.execute(
+            "INSERT OR IGNORE INTO word_pulse_label VALUES(?,?,?,?,?,?,?)",
+            (
+                label.theme_id,
+                label.archive_id,
+                label.cluster_id,
+                label.source,
+                versions[label.theme_id],
+                label.user_id,
+                label.event_time,
+            ),
+        )
+    for (theme_id, day), count in outcome.unclassified.items():
+        if theme_id in versions:
+            conn.execute(
+                """INSERT INTO word_pulse_unclassified VALUES(?,?,?,?)
+                ON CONFLICT(theme_id,day,rules_version) DO UPDATE SET count=count+excluded.count""",
+                (theme_id, day, versions[theme_id], count),
+            )
+
+
+def _write_budget(conn: sqlite3.Connection, group_id: str, used: int, now: int) -> None:
+    if used:
+        conn.execute(
+            """INSERT INTO word_pulse_budget VALUES(?,?,?)
+            ON CONFLICT(group_id,day) DO UPDATE SET used=used+excluded.used""",
+            (group_id, day_of(now), used),
+        )
+
+
+async def commit_live_batch(
+    group_id: str,
+    outcome: ClassifyOutcome,
+    new_cursor: int,
+    rules_versions: dict[int, int],
+    budget_used: int,
+    now: int,
+) -> None:
+    def operation(conn: sqlite3.Connection) -> None:
+        # Deletion during an AI request must not recreate orphan label rows.
+        existing = {
+            row[0]
+            for row in conn.execute("SELECT id FROM word_pulse_theme WHERE group_id=?", (group_id,))
+        }
+        versions = {key: version for key, version in rules_versions.items() if key in existing}
+        _write_outcome(conn, outcome, versions)
+        _write_budget(conn, group_id, budget_used, now)
+        conn.execute(
+            "UPDATE word_pulse_cursor SET last_archive_id=?,updated_at=? WHERE group_id=?",
+            (new_cursor, now, group_id),
+        )
+
+    await db.transaction(operation)
+
+
+async def commit_backfill_chunk(
+    theme_id: int,
+    rules_version: int,
+    outcome: ClassifyOutcome,
+    next_id: int | None,
+    budget_used: int,
+    now: int,
+) -> bool:
+    def operation(conn: sqlite3.Connection) -> bool:
+        row = conn.execute(
+            "SELECT group_id FROM word_pulse_theme WHERE id=? AND rules_version=? AND backfill_version=?",
+            (theme_id, rules_version, rules_version),
+        ).fetchone()
+        if row is None:
+            return False
+        _write_outcome(conn, outcome, {theme_id: rules_version})
+        _write_budget(conn, row[0], budget_used, now)
+        conn.execute(
+            "UPDATE word_pulse_theme SET backfill_next_id=? WHERE id=?", (next_id, theme_id)
+        )
+        return True
+
+    return await db.transaction(operation)
+
+
+async def get_budget_used(group_id: str, day: str) -> int:
     row = await db.fetch_one(
-        "SELECT id, group_id, theme_id, day, counts_json, samples_json, total_messages, sampled, computed_at "
-        "FROM word_pulse_bucket WHERE group_id=? AND theme_id=? AND day=?",
-        (group_id, theme_id, day),
+        "SELECT used FROM word_pulse_budget WHERE group_id=? AND day=?", (group_id, day)
     )
-    return None if row is None else dict(row)
+    return row[0] if row else 0
 
 
-async def delete_buckets_by_theme(group_id: str, theme_id: int) -> None:
-    await db.execute(
-        "DELETE FROM word_pulse_bucket WHERE group_id=? AND theme_id=?", (group_id, theme_id)
+async def purge_before(ts: int, day: str) -> int:
+    def operation(conn: sqlite3.Connection) -> int:
+        count = conn.execute("DELETE FROM word_pulse_label WHERE event_time<?", (ts,)).rowcount
+        conn.execute("DELETE FROM word_pulse_unclassified WHERE day<?", (day,))
+        conn.execute("DELETE FROM word_pulse_budget WHERE day<?", (day,))
+        return count
+
+    return await db.transaction(operation)
+
+
+def _aggregate_clusters(
+    conn: sqlite3.Connection, theme_id: int, rules_version: int, start_ts: int, end_ts: int
+) -> list[ClusterCounts]:
+    rows = conn.execute(
+        """SELECT cluster_id,COUNT(DISTINCT archive_id),COUNT(DISTINCT user_id)
+        FROM word_pulse_label WHERE theme_id=? AND rules_version=? AND event_time>=? AND event_time<?
+        GROUP BY cluster_id""",
+        (theme_id, rules_version, start_ts, end_ts),
+    )
+    return [ClusterCounts(*row) for row in rows]
+
+
+async def aggregate_clusters(
+    theme_id: int, rules_version: int, start_ts: int, end_ts: int
+) -> list[ClusterCounts]:
+    return await db.transaction(
+        lambda conn: _aggregate_clusters(conn, theme_id, rules_version, start_ts, end_ts)
     )
 
 
-async def delete_buckets_older_than(before_day: str) -> int:
-    row = await db.fetch_one(
-        "SELECT COUNT(*) AS cnt FROM word_pulse_bucket WHERE day < ?", (before_day,)
-    )
-    before = row["cnt"] if row else 0
-    await db.execute("DELETE FROM word_pulse_bucket WHERE day < ?", (before_day,))
-    return before
+def _aggregate_relevant(
+    conn: sqlite3.Connection, theme_id: int, rules_version: int, start_ts: int, end_ts: int
+) -> tuple[int, int]:
+    row = conn.execute(
+        """SELECT COUNT(DISTINCT archive_id),COUNT(DISTINCT user_id)
+        FROM word_pulse_label WHERE theme_id=? AND rules_version=? AND event_time>=? AND event_time<?""",
+        (theme_id, rules_version, start_ts, end_ts),
+    ).fetchone()
+    return row[0], row[1]
 
 
-async def get_bucket_days(group_id: str, theme_id: int) -> list[str]:
-    rows = await db.fetch_all(
-        "SELECT day FROM word_pulse_bucket WHERE group_id=? AND theme_id=? ORDER BY day",
-        (group_id, theme_id),
+async def aggregate_relevant(
+    theme_id: int, rules_version: int, start_ts: int, end_ts: int
+) -> tuple[int, int]:
+    return await db.transaction(
+        lambda conn: _aggregate_relevant(conn, theme_id, rules_version, start_ts, end_ts)
     )
-    return [r["day"] for r in rows]
+
+
+def _label_points(
+    conn: sqlite3.Connection, theme_id: int, rules_version: int, start_ts: int, end_ts: int
+) -> list[tuple[int, int, int]]:
+    rows = conn.execute(
+        """SELECT archive_id,cluster_id,event_time FROM word_pulse_label
+        WHERE theme_id=? AND rules_version=? AND event_time>=? AND event_time<?""",
+        (theme_id, rules_version, start_ts, end_ts),
+    )
+    return [(row[0], row[1], row[2]) for row in rows]
+
+
+async def fetch_label_points(
+    theme_id: int, rules_version: int, start_ts: int, end_ts: int
+) -> list[tuple[int, int, int]]:
+    return await db.transaction(
+        lambda conn: _label_points(conn, theme_id, rules_version, start_ts, end_ts)
+    )
+
+
+def _sum_unclassified(
+    conn: sqlite3.Connection, theme_id: int, rules_version: int, start_day: str, end_day: str
+) -> int:
+    row = conn.execute(
+        """SELECT COALESCE(SUM(count),0) FROM word_pulse_unclassified
+        WHERE theme_id=? AND rules_version=? AND day>=? AND day<=?""",
+        (theme_id, rules_version, start_day, end_day),
+    ).fetchone()
+    return row[0]
+
+
+async def sum_unclassified(theme_id: int, rules_version: int, start_day: str, end_day: str) -> int:
+    return await db.transaction(
+        lambda conn: _sum_unclassified(conn, theme_id, rules_version, start_day, end_day)
+    )
+
+
+async def load_report_data(
+    group_id: str, name: str, days: int, now: int, *, semantic_available: bool
+) -> ReportData | None:
+    """Read rules, progress and counts under the same connection lock and SQL snapshot."""
+    start, end = window_bounds(now, days)
+
+    def read(conn: sqlite3.Connection) -> ReportData | None:
+        # SELECT does not start a transaction under sqlite3's legacy transaction control.
+        conn.execute("BEGIN")
+        row = conn.execute(
+            "SELECT * FROM word_pulse_theme WHERE group_id=? AND name=?", (group_id, name)
+        ).fetchone()
+        if row is None:
+            return None
+        theme = _theme(conn, row)
+        cursor = conn.execute(
+            "SELECT updated_at FROM word_pulse_cursor WHERE group_id=?", (group_id,)
+        ).fetchone()
+        identity = (theme.id, theme.rules_version)
+        return build(
+            theme,
+            days,
+            cur_clusters=_aggregate_clusters(conn, *identity, start, end),
+            prev_clusters=_aggregate_clusters(
+                conn, *identity, start - days * SECONDS_PER_DAY, start
+            ),
+            cur_relevant=_aggregate_relevant(conn, *identity, start, end),
+            daily_rows=_label_points(conn, *identity, start, end),
+            unclassified=_sum_unclassified(conn, *identity, day_of(start), day_of(now)),
+            data_as_of=cursor[0] if cursor else None,
+            semantic_enabled=theme.mode == "semantic" and semantic_available,
+            now=now,
+        )
+
+    return await db.transaction(read)
+
+
+async def recent_example_ids(
+    theme_id: int, rules_version: int, cluster_ids: Sequence[int], start_ts: int, end_ts: int
+) -> dict[int, int]:
+    result = {}
+    for cluster_id in cluster_ids:
+        row = await db.fetch_one(
+            """SELECT archive_id FROM word_pulse_label
+            WHERE theme_id=? AND rules_version=? AND cluster_id=? AND event_time>=? AND event_time<?
+            ORDER BY event_time DESC,archive_id DESC LIMIT 1""",
+            (theme_id, rules_version, cluster_id, start_ts, end_ts),
+        )
+        if row:
+            result[cluster_id] = row[0]
+    return result
