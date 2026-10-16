@@ -85,6 +85,12 @@ def _invalid(action: Action) -> InvalidCommand:
     return InvalidCommand(f"格式：{USAGE[action]}\n示例：{_EXAMPLES[action]}")
 
 
+def action_of(text: str) -> Action | None:
+    """Resolve the management action from the command word alone, even if arguments are invalid."""
+    words = text.strip().removeprefix("/").split(maxsplit=1)
+    return _ACTIONS.get(words[0]) if words else None
+
+
 def parse(text: str) -> Command | InvalidCommand | None:
     text = text.strip().removeprefix("/")
     if text == "词频":
