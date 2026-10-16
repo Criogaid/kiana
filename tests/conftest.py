@@ -161,10 +161,23 @@ async def reset_word_pulse_tables() -> None:
     from src.storage import get_db
 
     ensure_schema()
-    await get_db().execute("DELETE FROM word_pulse_bucket")
-    await get_db().execute("DELETE FROM word_pulse_charset")
-    await get_db().execute("DELETE FROM word_pulse_cluster")
-    await get_db().execute("DELETE FROM word_pulse_theme")
+    for table in ("label", "unclassified", "budget", "cursor", "cluster", "theme"):
+        await get_db().execute(f"DELETE FROM word_pulse_{table}")
+
+
+@pytest.fixture(autouse=True)
+def reset_word_pulse_runtime(monkeypatch):
+    import asyncio
+    from src.plugins.word_pulse import classifiers, pipeline, report
+    from src.plugins.word_pulse.config import Config
+
+    classifiers._matchers.clear()
+    pipeline._fail_counts.clear()
+    monkeypatch.setattr(pipeline, "_tick_lock", asyncio.Lock())
+    report.result_cache.clear()
+    report._query_locks.clear()
+    monkeypatch.setattr(pipeline, "config", Config())
+    monkeypatch.setattr(report, "config", Config())
 
 
 @pytest_asyncio.fixture
