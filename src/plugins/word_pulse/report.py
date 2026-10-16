@@ -122,6 +122,7 @@ async def build_report(group_id: str, theme_name: str, window_days: int, now: in
             window_days,
             now,
             semantic_available=ai_available() and config.word_pulse_ai_daily_budget > 0,
+            retention_days=config.word_pulse_label_retention_days,
         )
         if data is None:
             return ReportResult(await _missing(group_id, theme_name), None)

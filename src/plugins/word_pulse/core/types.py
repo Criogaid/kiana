@@ -28,6 +28,8 @@ class ThemeRule:
     backfill_next_id: int | None
     backfill_until_id: int | None
     clusters: tuple[ClusterRule, ...]
+    # Labels of the current version are complete from this timestamp once backfill finishes.
+    coverage_since: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
