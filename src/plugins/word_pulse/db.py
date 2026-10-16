@@ -64,13 +64,16 @@ def ensure_schema() -> None:
             "aliases_json": "TEXT NOT NULL DEFAULT '[]'",
         },
     }
-    with db._conn:
+
+    def add_missing_columns(conn: sqlite3.Connection) -> None:
         for table, definitions in columns.items():
-            existing = {row[1] for row in db._conn.execute(f"PRAGMA table_info({table})")}
+            existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
             for name, definition in definitions.items():
                 if name not in existing:
                     # All interpolated identifiers come from the static mapping above.
-                    db._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+    db.migrate(add_missing_columns)
 
 
 def _clusters(conn: sqlite3.Connection, theme_id: int) -> tuple[ClusterRule, ...]:
