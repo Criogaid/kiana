@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 
-from .timeutil import day_of, local_datetime, window_bounds
+from .timeutil import SECONDS_PER_DAY, day_of, local_datetime, window_bounds
 from .types import OTHER, ThemeRule
 
 
@@ -38,6 +38,20 @@ class ReportData:
     data_as_of: int | None
     semantic_enabled: bool
     backfilling: bool
+
+
+def is_backfilling(theme: ThemeRule) -> bool:
+    return theme.backfill_version != theme.rules_version or theme.backfill_next_id is not None
+
+
+def previous_window_complete(
+    theme: ThemeRule, previous_start: int, now: int, retention_days: int
+) -> bool:
+    """Compare only when backfill and retention both cover the whole previous window."""
+    if theme.coverage_since is None or is_backfilling(theme):
+        return False
+    retained_since = now - retention_days * SECONDS_PER_DAY
+    return previous_start >= max(theme.coverage_since, retained_since)
 
 
 def build(
@@ -96,5 +110,5 @@ def build(
         unclassified,
         data_as_of,
         semantic_enabled,
-        theme.backfill_version != theme.rules_version or theme.backfill_next_id is not None,
+        is_backfilling(theme),
     )

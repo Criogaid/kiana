@@ -79,7 +79,7 @@ async def reconcile(theme: ThemeRule, now: int) -> None:
     first_id = await _archive.get_group_first_id_since(theme.group_id, start)
     until_id, _ = await _cursor(theme.group_id)
     next_id = first_id if first_id is not None and first_id <= until_id else None
-    await db.init_backfill(theme.id, theme.rules_version, next_id, until_id)
+    await db.init_backfill(theme.id, theme.rules_version, next_id, until_id, start)
 
 
 async def run_live(group_id: str, now: int) -> None:

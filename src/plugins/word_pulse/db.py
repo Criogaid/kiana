@@ -12,7 +12,7 @@ from pydantic import TypeAdapter
 
 from src.storage import get_db
 
-from .core.aggregate import ClusterCounts, ReportData, build
+from .core.aggregate import ClusterCounts, ReportData, build, previous_window_complete
 from .core.text import normalize
 from .core.timeutil import SECONDS_PER_DAY, day_of, window_bounds
 from .core.types import ClassifyOutcome, ClusterRule, ThemeMode, ThemeRule
@@ -58,6 +58,7 @@ def ensure_schema() -> None:
             "backfill_version": "INTEGER NOT NULL DEFAULT 0",
             "backfill_next_id": "INTEGER",
             "backfill_until_id": "INTEGER",
+            "coverage_since": "INTEGER",
         },
         "word_pulse_cluster": {
             "description": "TEXT NOT NULL DEFAULT ''",
@@ -98,6 +99,7 @@ def _theme(conn: sqlite3.Connection, row: sqlite3.Row) -> ThemeRule:
         row["backfill_next_id"],
         row["backfill_until_id"],
         _clusters(conn, row["id"]),
+        row["coverage_since"],
     )
 
 
@@ -308,12 +310,14 @@ async def touch_cursor(group_id: str, now: int) -> None:
 
 
 async def init_backfill(
-    theme_id: int, rules_version: int, next_id: int | None, until_id: int
+    theme_id: int, rules_version: int, next_id: int | None, until_id: int, coverage_since: int
 ) -> None:
     def operation(conn: sqlite3.Connection) -> None:
         changed = conn.execute(
-            "UPDATE word_pulse_theme SET backfill_version=?,backfill_next_id=?,backfill_until_id=? WHERE id=? AND rules_version=?",
-            (rules_version, next_id, until_id, theme_id, rules_version),
+            """UPDATE word_pulse_theme
+            SET backfill_version=?,backfill_next_id=?,backfill_until_id=?,coverage_since=?
+            WHERE id=? AND rules_version=?""",
+            (rules_version, next_id, until_id, coverage_since, theme_id, rules_version),
         ).rowcount
         if changed:
             conn.execute(
@@ -507,10 +511,17 @@ async def sum_unclassified(theme_id: int, rules_version: int, start_day: str, en
 
 
 async def load_report_data(
-    group_id: str, name: str, days: int, now: int, *, semantic_available: bool
+    group_id: str,
+    name: str,
+    days: int,
+    now: int,
+    *,
+    semantic_available: bool,
+    retention_days: int,
 ) -> ReportData | None:
     """Read rules, progress and counts under the same connection lock and SQL snapshot."""
     start, end = window_bounds(now, days)
+    previous_start = start - days * SECONDS_PER_DAY
 
     def read(conn: sqlite3.Connection) -> ReportData | None:
         # SELECT does not start a transaction under sqlite3's legacy transaction control.
@@ -525,12 +536,14 @@ async def load_report_data(
             "SELECT updated_at FROM word_pulse_cursor WHERE group_id=?", (group_id,)
         ).fetchone()
         identity = (theme.id, theme.rules_version)
+        # A partially covered previous window would inflate deltas, so omit them instead.
+        complete = previous_window_complete(theme, previous_start, now, retention_days)
         return build(
             theme,
             days,
             cur_clusters=_aggregate_clusters(conn, *identity, start, end),
-            prev_clusters=_aggregate_clusters(
-                conn, *identity, start - days * SECONDS_PER_DAY, start
+            prev_clusters=(
+                _aggregate_clusters(conn, *identity, previous_start, start) if complete else []
             ),
             cur_relevant=_aggregate_relevant(conn, *identity, start, end),
             daily_rows=_label_points(conn, *identity, start, end),

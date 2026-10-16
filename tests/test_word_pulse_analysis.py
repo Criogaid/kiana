@@ -81,3 +81,28 @@ def test_windows_and_budget_boundaries(app):
     assert take(-1, 10) == 0
     assert take(3, 10) == 3
     assert take(10, 3) == 3
+
+
+@pytest.mark.parametrize("coverage_since,backfill_version,next_id,previous_start,expected", [
+    pytest.param(None, 1, None, 500, False, id="unknown-coverage"),
+    pytest.param(500, 0, None, 500, False, id="stale-backfill-version"),
+    pytest.param(500, 1, 7, 500, False, id="pending-backfill"),
+    pytest.param(500, 1, None, 500, True, id="coverage-boundary-inclusive"),
+    pytest.param(500, 1, None, 499, False, id="before-coverage"),
+    pytest.param(0, 1, None, 100, True, id="retention-boundary-inclusive"),
+    pytest.param(0, 1, None, 99, False, id="before-retention"),
+    pytest.param(500, 1, None, 501, True, id="after-both-boundaries"),
+])
+def test_previous_window_complete(app, coverage_since, backfill_version, next_id, previous_start, expected):
+    from src.plugins.word_pulse.core.aggregate import previous_window_complete
+    from src.plugins.word_pulse.core.timeutil import SECONDS_PER_DAY
+    rule = replace(theme(), coverage_since=coverage_since, backfill_version=backfill_version, backfill_next_id=next_id)
+    retention_days = 31
+    now = retention_days * SECONDS_PER_DAY + 100
+    assert previous_window_complete(rule, previous_start, now, retention_days) is expected
+
+
+@pytest.mark.parametrize("version,next_id,expected", [(1, None, False), (0, None, True), (1, 7, True), (0, 7, True)])
+def test_is_backfilling(app, version, next_id, expected):
+    from src.plugins.word_pulse.core.aggregate import is_backfilling
+    assert is_backfilling(replace(theme(), backfill_version=version, backfill_next_id=next_id)) is expected
