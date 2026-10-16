@@ -27,7 +27,7 @@ Tests cover storage rollback and repeated cancellation, archive cursor bounds an
 
 ## Pending environment example update
 
-The user authorized a targeted example update, but the runtime permission policy still rejected reading `.env.prod` (`path_read`, rule `*.env.*`) on retry. Its Word Pulse example block still contains removed commands and configuration. P3 must not be marked complete or merged before this is addressed. Replace only that example block with the following; do not modify live credentials or `.env.dev`:
+The user authorized a targeted example update, but the runtime permission policy still rejected reading `.env.prod` (`path_read`, rule `*.env.*`) on retry. Its Word Pulse example block still contains removed commands and configuration. The user explicitly approved merging P3 and proceeding with P4/P5 while this example update remains an outstanding final acceptance item. Replace only that example block with the following; do not modify live credentials or `.env.dev`:
 
 ```dotenv
 # Word Pulse: background topic classification and read-only reports.
