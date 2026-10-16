@@ -47,7 +47,7 @@ async def test_commit_backfill_version_guard_and_live_visibility(app):
     theme = await seed()
     version = theme.rules_version
     await db.init_cursor("g", 4, 100)
-    await db.init_backfill(theme.id, version, 1, 4)
+    await db.init_backfill(theme.id, version, 1, 4, 0)
     outcome = ClassifyOutcome((Label(theme.id, 5, theme.clusters[0].id, "literal", "u", 100),), {(theme.id, "1970-01-01"): 1})
     await db.commit_live_batch("g", outcome, 5, {theme.id: version}, 1, 100)
     assert await db.get_cursor("g") == (5, 100)
@@ -55,7 +55,7 @@ async def test_commit_backfill_version_guard_and_live_visibility(app):
     await db.set_mode(theme.id, "literal")
     assert not await db.commit_backfill_chunk(theme.id, version, outcome, None, 1, 101)
     assert await db.aggregate_relevant(theme.id, version + 1, 0, 200) == (0, 0)
-    await db.init_backfill(theme.id, version + 1, 1, 5)
+    await db.init_backfill(theme.id, version + 1, 1, 5, 0)
     assert await db.aggregate_relevant(theme.id, version, 0, 200) == (0, 0)
     assert await db.commit_backfill_chunk(theme.id, version + 1, outcome, None, 1, 102)
     assert (await db.get_theme("g", "炒股")).backfill_next_id is None
@@ -112,7 +112,7 @@ async def test_report_snapshot_excludes_concurrent_batch(app, monkeypatch):
         return result
 
     monkeypatch.setattr(db, "_aggregate_clusters", pause)
-    reader = asyncio.create_task(db.load_report_data("g", "炒股", 7, now, semantic_available=True))
+    reader = asyncio.create_task(db.load_report_data("g", "炒股", 7, now, semantic_available=True, retention_days=31))
     writer = None
     try:
         assert await asyncio.to_thread(entered.wait, 5)
@@ -127,7 +127,7 @@ async def test_report_snapshot_excludes_concurrent_batch(app, monkeypatch):
             await writer
     assert data.relevant_messages == 0 and not data.clusters
     assert data.data_as_of == now
-    fresh = await db.load_report_data("g", "炒股", 7, now + 1, semantic_available=True)
+    fresh = await db.load_report_data("g", "炒股", 7, now + 1, semantic_available=True, retention_days=31)
     assert fresh.relevant_messages == fresh.clusters[0].messages == 1
     assert fresh.data_as_of == now + 1
 
@@ -154,7 +154,74 @@ async def test_migration_preserves_legacy_rules_and_drops_derived_tables(app, tm
             assert theme.backfill_version == 0
             assert theme.clusters[0].aliases == ("止损",)
             assert theme.clusters[0].description == ""
+            assert theme.coverage_since is None
+            columns = {row[1]: row[2] for row in await manager.fetch_all("PRAGMA table_info(word_pulse_theme)")}
+            assert columns["coverage_since"] == "INTEGER"
+            await db.init_backfill(theme.id, theme.rules_version, None, 0, 123)
+            db.ensure_schema()
+            assert (await db.get_theme("g", "炒股")).coverage_since == 123
             tables = {row[0] for row in await manager.fetch_all("SELECT name FROM sqlite_master WHERE type='table'")}
             assert not {"word_pulse_bucket", "word_pulse_charset"} & tables
     finally:
         await manager.close()
+
+
+async def test_init_backfill_writes_coverage_only_for_current_version(app):
+    from src.plugins.word_pulse import db
+    theme = await seed()
+    await db.init_backfill(theme.id, theme.rules_version + 1, 1, 4, 100)
+    assert await db.get_theme("g", "炒股") == theme
+    await db.init_backfill(theme.id, theme.rules_version, 1, 4, 100)
+    initialized = await db.get_theme("g", "炒股")
+    assert initialized.coverage_since == 100
+    assert initialized.backfill_version == theme.rules_version
+    assert initialized.backfill_next_id == 1
+    await db.set_mode(theme.id, "literal")
+    changed = await db.get_theme("g", "炒股")
+    await db.init_backfill(theme.id, theme.rules_version, None, 5, 200)
+    assert await db.get_theme("g", "炒股") == changed
+
+
+@pytest.mark.parametrize("state,days,retention_days", [
+    ("complete", 7, 31),
+    ("partial", 7, 31),
+    ("unknown", 7, 31),
+    ("version_mismatch", 7, 31),
+    ("backfilling", 7, 31),
+    ("retention_limited", 16, 31),
+])
+async def test_report_delta_requires_complete_previous_window(app, state, days, retention_days):
+    from datetime import datetime
+    from src.plugins.word_pulse import db
+    from src.plugins.word_pulse.core.timeutil import SECONDS_PER_DAY, TZ, window_bounds
+    from src.plugins.word_pulse.core.types import ClassifyOutcome, Label
+
+    theme = await seed()
+    await db.set_mode(theme.id, "literal")
+    theme = await db.get_theme("g", "炒股")
+    now = int(datetime(2026, 10, 16, 12, tzinfo=TZ).timestamp())
+    start, _ = window_bounds(now, days)
+    previous_start = start - days * SECONDS_PER_DAY
+    await db.init_cursor("g", 0, now)
+    if state not in {"unknown", "version_mismatch"}:
+        coverage = start - SECONDS_PER_DAY if state == "partial" else previous_start
+        await db.init_backfill(theme.id, theme.rules_version, 1 if state == "backfilling" else None, 4, coverage)
+    if state == "version_mismatch":
+        await db.init_backfill(theme.id, theme.rules_version, None, 4, previous_start)
+        await db.set_mode(theme.id, "semantic")
+        theme = await db.get_theme("g", "炒股")
+
+    first, second = (cluster.id for cluster in theme.clusters)
+    outcome = ClassifyOutcome((
+        Label(theme.id, 1, first, "literal", "u", start - 1),
+        Label(theme.id, 2, first, "literal", "u", now),
+        Label(theme.id, 3, first, "literal", "v", now),
+        Label(theme.id, 4, second, "literal", "v", now),
+    ), {})
+    await db.commit_live_batch("g", outcome, 4, {theme.id: theme.rules_version}, 0, now)
+    assert await db.aggregate_relevant(theme.id, theme.rules_version, previous_start, start) == (1, 1)
+    data = await db.load_report_data("g", "炒股", days, now, semantic_available=True, retention_days=retention_days)
+    assert data is not None
+    assert {row.cluster_id: row.messages for row in data.clusters} == {first: 2, second: 1}
+    expected = {first: 1, second: 1} if state == "complete" else {first: None, second: None}
+    assert {row.cluster_id: row.delta for row in data.clusters} == expected

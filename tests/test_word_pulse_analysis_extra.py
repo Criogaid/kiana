@@ -103,3 +103,23 @@ async def test_noise_is_skipped_but_cursor_advances(app):
     assert (await db.get_cursor("g"))[0] == end
     assert await db.aggregate_relevant(theme.id, theme.rules_version, 0, 100) == (0, 0)
     assert await db.sum_unclassified(theme.id, theme.rules_version, "1970-01-01", "1970-01-01") == 0
+
+
+@pytest.mark.parametrize("has_archive", [False, True])
+async def test_reconcile_records_backfill_window_coverage(app, monkeypatch, has_archive):
+    from datetime import datetime
+    from src.plugins.word_pulse import db, pipeline
+    from src.plugins.word_pulse.core.timeutil import TZ, window_bounds
+    theme = await setup_theme()
+    now = int(datetime(2026, 10, 16, 12, tzinfo=TZ).timestamp())
+    monkeypatch.setattr(pipeline.config, "word_pulse_backfill_days", 3)
+    start, _ = window_bounds(now, 3)
+    archive_id = await archive("割肉", start) if has_archive else None
+    await pipeline.ensure_cursor("g", now)
+    await pipeline.reconcile(theme, now)
+    current = await db.get_theme("g", "炒股")
+    assert current.coverage_since == start
+    assert current.backfill_version == current.rules_version
+    assert current.backfill_next_id == archive_id
+    await pipeline.reconcile(current, now + 86400)
+    assert await db.get_theme("g", "炒股") == current
