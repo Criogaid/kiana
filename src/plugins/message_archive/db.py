@@ -1,7 +1,11 @@
+"""Append-only text archive; Word Pulse cursors and backfills require no text retention purge."""
+
 from __future__ import annotations
 
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
+from itertools import batched
 from typing import Literal
 
 from nonebot import get_plugin_config
@@ -33,6 +37,18 @@ class ArchivedMessage:
     plain_text: str
 
 
+@dataclass(frozen=True, slots=True)
+class ArchivedText:
+    id: int
+    event_time: int
+    user_id: str
+    self_id: str
+    plain_text: str
+
+
+ARCHIVE_ID_BATCH_SIZE = 900  # Stay below SQLite builds with a 999-parameter limit.
+
+
 def ensure_schema() -> None:
     """确保消息归档表结构存在。"""
     db.ensure_schema(
@@ -56,6 +72,10 @@ def ensure_schema() -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_message_archive_session_time
             ON message_archive (session_type, session_id, event_time, id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_message_archive_session_id
+            ON message_archive (session_type, session_id, id)
             """,
             """
             CREATE INDEX IF NOT EXISTS idx_message_archive_session_user_time
@@ -291,3 +311,54 @@ async def fetch_group_messages_by_time_range(
         )
         for row in rows
     ]
+
+
+async def fetch_group_texts_after_id(
+    group_id: str, after_id: int, *, until_id: int | None = None, limit: int
+) -> list[ArchivedText]:
+    """Read nonempty group text after an exclusive cursor, up to an inclusive end ID."""
+    if limit < 1:
+        raise ValueError("limit: must be a positive integer")
+    rows = await db.fetch_all(
+        """SELECT id, event_time, user_id, self_id, plain_text FROM message_archive
+        WHERE session_type = 'group' AND session_id = ? AND id > ?
+          AND (? IS NULL OR id <= ?) AND plain_text <> ''
+        ORDER BY id ASC LIMIT ?""",
+        (group_id, after_id, until_id, until_id, limit),
+    )
+    return [ArchivedText(**dict(row)) for row in rows]
+
+
+async def get_group_max_id(group_id: str) -> int:
+    """Return the largest group archive ID, including empty text, or zero."""
+    row = await db.fetch_one(
+        """SELECT COALESCE(MAX(id), 0) AS last_id FROM message_archive
+        WHERE session_type = 'group' AND session_id = ?""",
+        (group_id,),
+    )
+    return row["last_id"] if row else 0
+
+
+async def get_group_first_id_since(group_id: str, start_time: int) -> int | None:
+    """Return the first group archive ID at or after the inclusive timestamp."""
+    row = await db.fetch_one(
+        """SELECT MIN(id) AS first_id FROM message_archive
+        WHERE session_type = 'group' AND session_id = ? AND event_time >= ?""",
+        (group_id, start_time),
+    )
+    return row["first_id"] if row else None
+
+
+async def fetch_texts_by_ids(ids: Sequence[int]) -> dict[int, ArchivedText]:
+    """Fetch text projections in bounded batches; missing IDs are omitted."""
+    result: dict[int, ArchivedText] = {}
+    for chunk in batched(dict.fromkeys(ids), ARCHIVE_ID_BATCH_SIZE, strict=False):
+        placeholders = ",".join("?" for _ in chunk)
+        rows = await db.fetch_all(
+            "SELECT id, event_time, user_id, self_id, plain_text FROM message_archive "  # noqa: S608 - only placeholders are interpolated
+            f"WHERE id IN ({placeholders})",
+            chunk,
+        )
+        for row in rows:
+            result[row["id"]] = ArchivedText(**dict(row))
+    return result
