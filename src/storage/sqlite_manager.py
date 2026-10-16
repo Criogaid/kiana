@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import os
 import sqlite3
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -46,15 +47,38 @@ class SQLiteManager:
         result = await self._run(sql, params, fetch_kind="all")
         return result if result is not None else []
 
+    async def transaction[T](self, operation: Callable[[sqlite3.Connection], T]) -> T:
+        """Commit or roll back a callback, retaining the connection until cancelled work ends."""
+        return await self._run_serialized(partial(self._transaction_sync, operation))
+
     async def close(self) -> None:
         async with self._lock:
             self._conn.close()
 
     async def _run(self, sql: str, params: Sequence[Any] | None, fetch_kind: str | None) -> Any:
         args = tuple(params) if params is not None else ()
-        loop = asyncio.get_running_loop()
+        return await self._run_serialized(partial(self._execute_sync, sql, args, fetch_kind))
+
+    async def _run_serialized[T](self, operation: Callable[[], T]) -> T:
         async with self._lock:
-            return await loop.run_in_executor(None, self._execute_sync, sql, args, fetch_kind)
+            future = asyncio.get_running_loop().run_in_executor(None, operation)
+            cancellation: asyncio.CancelledError | None = None
+            # Cancellation cannot stop SQLite's worker; retain the lock until it exits.
+            while not future.done():
+                try:
+                    await asyncio.shield(future)
+                except asyncio.CancelledError as error:
+                    cancellation = error
+                except Exception:
+                    if cancellation is None:
+                        raise
+            if cancellation is not None:
+                try:
+                    future.result()
+                except Exception as error:
+                    raise cancellation from error
+                raise cancellation
+            return future.result()
 
     def _execute_sync(self, sql: str, params: tuple[Any, ...], fetch_kind: str | None) -> Any:
         cursor = self._conn.execute(sql, params)
@@ -67,6 +91,10 @@ class SQLiteManager:
             result = None
         self._conn.commit()
         return result
+
+    def _transaction_sync[T](self, operation: Callable[[sqlite3.Connection], T]) -> T:
+        with self._conn:
+            return operation(self._conn)
 
 
 def _resolve_db_path() -> Path:
