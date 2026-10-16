@@ -5,33 +5,18 @@ import json
 from nonebot import logger, require
 from pydantic import BaseModel, Field
 
+from .errors import (
+    WordPulseAIAuthError,
+    WordPulseAIConfigError,
+    WordPulseAIError,  # noqa: F401 - exported for the old entry until P3
+    WordPulseAIResponseError,
+    WordPulseAIServiceError,
+    WordPulseAITimeoutError,
+)
+
 _ai = require("src.plugins.ai_provider")
 
 CALLER = "word_pulse"
-
-
-class WordPulseAIError(Exception):
-    """AI 分析失败基类。"""
-
-
-class WordPulseAIConfigError(WordPulseAIError):
-    """AI 配置或请求参数不合法。"""
-
-
-class WordPulseAITimeoutError(WordPulseAIError):
-    """AI 请求超时。"""
-
-
-class WordPulseAIAuthError(WordPulseAIError):
-    """AI 鉴权失败。"""
-
-
-class WordPulseAIServiceError(WordPulseAIError):
-    """AI 服务异常。"""
-
-
-class WordPulseAIResponseError(WordPulseAIError):
-    """AI 返回格式异常。"""
 
 
 _AI_ERRORS = _ai.AIErrorTypes(

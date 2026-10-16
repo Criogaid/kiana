@@ -44,12 +44,52 @@ SCHEMA_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_word_pulse_theme_group ON word_pulse_theme(group_id)",
     "CREATE INDEX IF NOT EXISTS idx_word_pulse_cluster_theme ON word_pulse_cluster(theme_id)",
     "CREATE INDEX IF NOT EXISTS idx_word_pulse_bucket_lookup ON word_pulse_bucket(group_id, theme_id, day)",
+    """CREATE TABLE IF NOT EXISTS word_pulse_label (
+        theme_id INTEGER NOT NULL, archive_id INTEGER NOT NULL, cluster_id INTEGER NOT NULL,
+        source TEXT NOT NULL, rules_version INTEGER NOT NULL, user_id TEXT NOT NULL,
+        event_time INTEGER NOT NULL, PRIMARY KEY(theme_id, archive_id, cluster_id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_word_pulse_label_theme_time "
+    "ON word_pulse_label(theme_id, rules_version, event_time)",
+    """CREATE TABLE IF NOT EXISTS word_pulse_unclassified (
+        theme_id INTEGER NOT NULL, day TEXT NOT NULL, rules_version INTEGER NOT NULL,
+        count INTEGER NOT NULL, PRIMARY KEY(theme_id, day, rules_version)
+    )""",
+    """CREATE TABLE IF NOT EXISTS word_pulse_cursor (
+        group_id TEXT PRIMARY KEY, last_archive_id INTEGER NOT NULL, updated_at INTEGER NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS word_pulse_budget (
+        group_id TEXT NOT NULL, day TEXT NOT NULL, used INTEGER NOT NULL,
+        PRIMARY KEY(group_id, day)
+    )""",
 ]
 
 
 def ensure_schema() -> None:
     db.ensure_schema(SCHEMA_STATEMENTS)
     _ensure_aliases_column()
+    _ensure_rule_columns()
+
+
+def _ensure_rule_columns() -> None:
+    """Upgrade existing rules without dropping old buckets before the P3 cutover."""
+    columns = {
+        "word_pulse_theme": {
+            "mode": "TEXT NOT NULL DEFAULT 'semantic'",
+            "rules_version": "INTEGER NOT NULL DEFAULT 1",
+            "backfill_version": "INTEGER NOT NULL DEFAULT 0",
+            "backfill_next_id": "INTEGER",
+            "backfill_until_id": "INTEGER",
+        },
+        "word_pulse_cluster": {"description": "TEXT NOT NULL DEFAULT ''"},
+    }
+    with db._conn:
+        for table, definitions in columns.items():
+            existing = {row[1] for row in db._conn.execute(f"PRAGMA table_info({table})")}
+            for name, definition in definitions.items():
+                if name not in existing:
+                    # Identifiers and declarations come only from the static mapping above.
+                    db._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
 
 def _ensure_aliases_column() -> None:
@@ -135,7 +175,10 @@ async def replace_clusters(theme_id: int, names: list[str]) -> list[int]:
                 "INSERT INTO word_pulse_cluster (theme_id, name, created_at) VALUES (?, ?, ?)",
                 (theme_id, name, now),
             )
-            row = await db.fetch_one("SELECT id FROM word_pulse_cluster WHERE theme_id = ? AND name = ?", (theme_id, name))
+            row = await db.fetch_one(
+                "SELECT id FROM word_pulse_cluster WHERE theme_id = ? AND name = ?",
+                (theme_id, name),
+            )
             assert row is not None
             result_ids.append(row["id"])
     return result_ids
@@ -153,7 +196,9 @@ async def add_clusters(theme_id: int, names: list[str]) -> list[int]:
             "INSERT INTO word_pulse_cluster (theme_id, name, created_at) VALUES (?, ?, ?)",
             (theme_id, name, now),
         )
-        row = await db.fetch_one("SELECT id FROM word_pulse_cluster WHERE theme_id = ? AND name = ?", (theme_id, name))
+        row = await db.fetch_one(
+            "SELECT id FROM word_pulse_cluster WHERE theme_id = ? AND name = ?", (theme_id, name)
+        )
         assert row is not None
         new_ids.append(row["id"])
         existing_names.add(name)
@@ -184,7 +229,10 @@ async def delete_cluster(cluster_id: int) -> None:
 
 
 async def add_cluster_aliases(
-    cluster_id: int, aliases: list[str], *, theme_id: int | None = None,
+    cluster_id: int,
+    aliases: list[str],
+    *,
+    theme_id: int | None = None,
 ) -> list[str]:
     """给 cluster 追加别名。
 
@@ -203,7 +251,8 @@ async def add_cluster_aliases(
         return []
     if theme_id is None:
         row = await db.fetch_one(
-            "SELECT theme_id FROM word_pulse_cluster WHERE id = ?", (cluster_id,),
+            "SELECT theme_id FROM word_pulse_cluster WHERE id = ?",
+            (cluster_id,),
         )
         if row is None:
             return []
@@ -211,13 +260,15 @@ async def add_cluster_aliases(
 
     # 同主题内所有 cluster 名字（包括自己）作为黑名单
     existing_clusters = await db.fetch_all(
-        "SELECT name FROM word_pulse_cluster WHERE theme_id = ?", (theme_id,),
+        "SELECT name FROM word_pulse_cluster WHERE theme_id = ?",
+        (theme_id,),
     )
     reserved_names = {r["name"] for r in existing_clusters}
 
     # 当前别名
     row = await db.fetch_one(
-        "SELECT aliases_json FROM word_pulse_cluster WHERE id = ?", (cluster_id,),
+        "SELECT aliases_json FROM word_pulse_cluster WHERE id = ?",
+        (cluster_id,),
     )
     if row is None:
         return []
@@ -258,7 +309,8 @@ async def remove_cluster_aliases(cluster_id: int, aliases: list[str]) -> list[st
     if not aliases:
         return []
     row = await db.fetch_one(
-        "SELECT aliases_json FROM word_pulse_cluster WHERE id = ?", (cluster_id,),
+        "SELECT aliases_json FROM word_pulse_cluster WHERE id = ?",
+        (cluster_id,),
     )
     if row is None:
         return []
@@ -315,9 +367,13 @@ async def get_expanded_charset(theme_id: int) -> set[str]:
 
 
 async def save_bucket(
-    group_id: str, theme_id: int, day: str,
-    counts_json: str, samples_json: str,
-    total_messages: int, sampled: bool,
+    group_id: str,
+    theme_id: int,
+    day: str,
+    counts_json: str,
+    samples_json: str,
+    total_messages: int,
+    sampled: bool,
 ) -> None:
     now = int(time.time())
     sampled_int = 1 if sampled else 0
@@ -341,11 +397,15 @@ async def get_bucket(group_id: str, theme_id: int, day: str) -> dict | None:
 
 
 async def delete_buckets_by_theme(group_id: str, theme_id: int) -> None:
-    await db.execute("DELETE FROM word_pulse_bucket WHERE group_id=? AND theme_id=?", (group_id, theme_id))
+    await db.execute(
+        "DELETE FROM word_pulse_bucket WHERE group_id=? AND theme_id=?", (group_id, theme_id)
+    )
 
 
 async def delete_buckets_older_than(before_day: str) -> int:
-    row = await db.fetch_one("SELECT COUNT(*) AS cnt FROM word_pulse_bucket WHERE day < ?", (before_day,))
+    row = await db.fetch_one(
+        "SELECT COUNT(*) AS cnt FROM word_pulse_bucket WHERE day < ?", (before_day,)
+    )
     before = row["cnt"] if row else 0
     await db.execute("DELETE FROM word_pulse_bucket WHERE day < ?", (before_day,))
     return before
