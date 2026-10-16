@@ -3,7 +3,7 @@
 import time
 
 from nonebot import get_driver, logger
-from nonebot.adapters.onebot.v11 import GroupMessageEvent, MessageEvent
+from nonebot.adapters.onebot.v11 import GroupMessageEvent, Message, MessageEvent, MessageSegment
 from nonebot.matcher import Matcher
 
 from . import candidates, db, report
@@ -40,7 +40,7 @@ async def handle(event: MessageEvent, matcher: Matcher) -> None:
     await matcher.send(text)
 
 
-async def dispatch(group_id: str, command: Command) -> str:
+async def dispatch(group_id: str, command: Command) -> str | Message:
     match command.action:
         case "overview":
             return await report.build_overview(group_id)
@@ -52,6 +52,8 @@ async def dispatch(group_id: str, command: Command) -> str:
             result = await report.build_report(
                 group_id, command.theme, command.window_days, int(time.time())
             )
+            if result.chart is not None:
+                return Message(result.text) + MessageSegment.image(result.chart)
             return result.text
         case "add":
             result = await db.add_clusters(group_id, command.theme, command.args)

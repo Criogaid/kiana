@@ -33,6 +33,7 @@ class ReportData:
     relevant_users: int
     clusters: tuple[ClusterStat, ...]
     daily: tuple[tuple[str, dict[int, int]], ...]
+    daily_totals: tuple[int, ...]
     unclassified: int
     data_as_of: int | None
     semantic_enabled: bool
@@ -91,6 +92,7 @@ def build(
         users,
         clusters,
         daily,
+        tuple(len(set().union(*counts.values())) for counts in buckets.values()),
         unclassified,
         data_as_of,
         semantic_enabled,
